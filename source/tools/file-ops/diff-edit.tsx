@@ -1,17 +1,36 @@
 import {constants} from 'node:fs';
-import {access, writeFile} from 'node:fs/promises';
+import {access, lstat} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {Box, Text} from 'ink';
 import React from 'react';
-import ToolMessage from '@/components/tool-message';
+import ToolMessage, {CappedLines} from '@/components/tool-message';
+import {
+	enforceFirewall,
+	evaluateMutationEnvelope,
+} from '@/firewall/mutation-firewall';
 import {ThemeContext} from '@/hooks/useTheme';
+import {getSafeSessionCwd} from '@/services/session-cwd';
+import {EditRecoveryError} from '@/tools/file-ops/edit-recovery';
+import {replaceFirstLiteral} from '@/tools/file-ops/literal-replace';
+import {
+	validateEditableEncoding,
+	validateEditableFormat,
+	validatePath,
+} from '@/tools/file-ops/path-validators';
+import {
+	forgetReadContent,
+	getLineNumbersForText,
+	hasSeenFile,
+	hasVisibleLines,
+	markFileSeen,
+	recordEditVisibility,
+} from '@/tools/runtime/read-tracker';
+import {createFileToolApproval} from '@/tools/runtime/tool-approval';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {getCachedFileContent, invalidateCache} from '@/utils/file-cache';
-import {validatePath} from '@/utils/path-validators';
-import {hasSeenFile, markFileSeen} from '@/utils/read-tracker';
-import {createFileToolApproval} from '@/utils/tool-approval';
+import {atomicWriteUserFile} from '@/utils/fs/atomic-write';
+import {getCachedFileContent, invalidateCache} from '@/utils/fs/file-cache';
 import {
 	closeDiffInVSCode,
 	isVSCodeConnected,
@@ -21,6 +40,7 @@ import {
 interface DiffEditArgs {
 	path: string;
 	diff: string;
+	description?: string;
 }
 
 export interface DiffEditBlock {
@@ -31,6 +51,19 @@ export interface DiffEditBlock {
 const SEARCH_MARKER = '<<<<<<< SEARCH';
 const SEPARATOR_MARKER = '=======';
 const REPLACE_MARKER = '>>>>>>> REPLACE';
+const DIFF_EDIT_CONTEXT_LINES = 3;
+const MAX_DIFF_EDIT_RESULT_CHARS = 4000;
+
+function capDiffEditResult(content: string): string {
+	if (content.length <= MAX_DIFF_EDIT_RESULT_CHARS) return content;
+
+	const marker = `\n... [Preview truncated: ${content.length} characters; use read_file with a narrow range to inspect omitted content] ...\n`;
+	const remainingLength = MAX_DIFF_EDIT_RESULT_CHARS - marker.length;
+	const headLength = Math.floor(remainingLength / 2);
+	const tailLength = remainingLength - headLength;
+
+	return `${content.slice(0, headLength)}${marker}${content.slice(-tailLength)}`;
+}
 
 function stripSingleBoundaryNewline(value: string): string {
 	if (value.startsWith('\r\n')) return value.slice(2);
@@ -109,7 +142,11 @@ function countOccurrences(content: string, search: string): number {
 	return content.split(search).length - 1;
 }
 
-function validateBlocks(fileContent: string, blocks: DiffEditBlock[]): void {
+function validateBlocks(
+	fileContent: string,
+	blocks: DiffEditBlock[],
+	path: string,
+): string {
 	const seenSearchBlocks = new Set<string>();
 
 	blocks.forEach((block, index) => {
@@ -124,8 +161,12 @@ function validateBlocks(fileContent: string, blocks: DiffEditBlock[]): void {
 		const occurrences = countOccurrences(fileContent, block.search);
 
 		if (occurrences === 0) {
-			throw new Error(
+			throw new EditRecoveryError(
 				`Search block ${blockNumber} was not found in file. The file may have changed since you last read it.`,
+				path,
+				fileContent,
+				block.search,
+				blockNumber,
 			);
 		}
 
@@ -135,6 +176,10 @@ function validateBlocks(fileContent: string, blocks: DiffEditBlock[]): void {
 			);
 		}
 	});
+
+	// A unique original match may disappear or become ambiguous after an edit.
+	// Dry-run execution too, before approval or any file writes.
+	return applyBlocks(fileContent, blocks);
 }
 
 function applyBlocks(fileContent: string, blocks: DiffEditBlock[]): string {
@@ -148,46 +193,153 @@ function applyBlocks(fileContent: string, blocks: DiffEditBlock[]): string {
 			);
 		}
 
-		newContent = newContent.replace(block.search, block.replace);
+		newContent = replaceFirstLiteral(newContent, block.search, block.replace);
 	});
 
 	return newContent;
 }
 
-function formatUpdatedFileContext(content: string): string {
-	const lines = content.split('\n');
-	let fileContext = '\n\nUpdated file contents:\n';
+function formatUpdatedFileContext(
+	originalContent: string,
+	updatedContent: string,
+	blocks: DiffEditBlock[],
+): string {
+	const lines = updatedContent.split('\n');
+	let cumulativeOffset = 0;
+	const changedRanges = blocks
+		.map(block => ({
+			block,
+			originalIndex: originalContent.indexOf(block.search),
+		}))
+		.sort((a, b) => a.originalIndex - b.originalIndex)
+		.map(({block, originalIndex}) => {
+			const updatedIndex = originalIndex + cumulativeOffset;
+			const changedStart = updatedContent
+				.slice(0, updatedIndex)
+				.split('\n').length;
+			const replacementLineCount = Math.max(
+				1,
+				block.replace.split('\n').length,
+			);
+			const changedEnd = Math.min(
+				lines.length,
+				changedStart + replacementLineCount - 1,
+			);
 
-	for (let i = 0; i < lines.length; i++) {
-		const lineNumStr = String(i + 1).padStart(4, ' ');
-		const line = lines[i] || '';
-		fileContext += `${lineNumStr}: ${line}\n`;
-	}
+			cumulativeOffset += block.replace.length - block.search.length;
+			return {
+				changedStart,
+				changedEnd,
+				start: Math.max(1, changedStart - DIFF_EDIT_CONTEXT_LINES),
+				end: Math.min(lines.length, changedEnd + DIFF_EDIT_CONTEXT_LINES),
+			};
+		});
+	const changedRegionSummary = changedRanges
+		.map(({changedStart, changedEnd}) =>
+			changedStart === changedEnd
+				? String(changedStart)
+				: `${changedStart}-${changedEnd}`,
+		)
+		.join(', ');
 
-	return fileContext;
+	const contextWindows = changedRanges.reduce<
+		Array<{start: number; end: number}>
+	>((windows, range) => {
+		const previous = windows.at(-1);
+		if (previous && range.start <= previous.end + 1) {
+			previous.end = Math.max(previous.end, range.end);
+		} else {
+			windows.push({...range});
+		}
+		return windows;
+	}, []);
+
+	return (
+		`\n\nChanged regions: lines ${changedRegionSummary}.` +
+		contextWindows
+			.map(({start, end}, index) => {
+				let context = `\n\nUpdated file context (lines ${start}-${end} of ${lines.length}):\n`;
+				const previousEnd = contextWindows[index - 1]?.end ?? 0;
+				if (start > previousEnd + 1) {
+					context += `[... lines ${previousEnd + 1}-${start - 1} omitted ...]\n`;
+				}
+
+				for (let lineNumber = start; lineNumber <= end; lineNumber++) {
+					const lineNumStr = String(lineNumber).padStart(4, ' ');
+					context += `${lineNumStr}: ${lines[lineNumber - 1] || ''}\n`;
+				}
+
+				if (index === contextWindows.length - 1 && end < lines.length) {
+					context += `[... lines ${end + 1}-${lines.length} omitted ...]\n`;
+				}
+				return context;
+			})
+			.join('')
+	);
 }
 
 const executeDiffEdit = async (args: DiffEditArgs): Promise<string> => {
 	const {path, diff} = args;
-	const absPath = resolve(path);
+	const formatResult = validateEditableFormat(path);
+	if (!formatResult.valid) {
+		throw new Error(formatResult.error);
+	}
+
+	const absPath = resolve(getSafeSessionCwd(), path);
 	const blocks = parseDiffEditBlocks(diff);
 	const cached = await getCachedFileContent(absPath);
+	const encodingResult = validateEditableEncoding(path, cached);
+	if (!encodingResult.valid) {
+		throw new Error(encodingResult.error);
+	}
 	const fileContent = cached.content;
 
-	validateBlocks(fileContent, blocks);
-	const newContent = applyBlocks(fileContent, blocks);
+	const newContent = validateBlocks(fileContent, blocks, path);
 
-	await writeFile(absPath, newContent, 'utf-8');
+	const firewallResult = evaluateMutationEnvelope(
+		path,
+		fileContent,
+		newContent,
+	);
+	const firewallWarning = enforceFirewall(firewallResult);
+
+	await atomicWriteUserFile(absPath, newContent);
 	invalidateCache(absPath);
 	markFileSeen(absPath);
+	forgetReadContent(absPath);
+	// Carry what the agent had read forward through the edit: each block
+	// moves the lines below it and the written region counts as seen. Blocks
+	// are applied in order, so positions follow the evolving content.
+	try {
+		const stats = await lstat(absPath);
+		let working = fileContent;
+		for (const block of blocks) {
+			const blockLines = getLineNumbersForText(working, block.search);
+			if (blockLines.length === 0) continue;
+			recordEditVisibility(
+				absPath,
+				stats,
+				blockLines[0],
+				blockLines.length,
+				block.replace.replace(/\r\n/g, '\n').split('\n').length,
+			);
+			working = replaceFirstLiteral(working, block.search, block.replace);
+		}
+	} catch {
+		// If stat fails, fall back to file-level tracking only
+	}
 
 	const blockLabel = blocks.length === 1 ? 'block' : 'blocks';
-	return `Successfully applied ${blocks.length} diff ${blockLabel}.${formatUpdatedFileContext(newContent)}`;
+	return (
+		capDiffEditResult(
+			`Successfully applied ${blocks.length} diff ${blockLabel}.${formatUpdatedFileContext(fileContent, newContent, blocks)}`,
+		) + firewallWarning
+	);
 };
 
 const diffEditCoreTool = tool({
 	description:
-		'Apply one or more SEARCH/REPLACE edit blocks to a file. Use this for weak local models when exact string_replace arguments are hard to produce. Every SEARCH block must match the file exactly once. Format: <<<<<<< SEARCH, old content, =======, new content, >>>>>>> REPLACE. Do not wrap the diff in a markdown code fence.',
+		'Apply one or more SEARCH/REPLACE edit blocks to a file. Use this for weak local models when exact string_replace arguments are hard to produce. Every SEARCH block must match the file exactly once. Format: <<<<<<< SEARCH, old content, =======, new content, >>>>>>> REPLACE. Do not wrap the diff in a markdown code fence. Successful edits return bounded context around changed regions instead of the entire file. Missing SEARCH blocks return recovery evidence: verify the candidate and retry with its exact actualText; read the indicated range if text is omitted.',
 	inputSchema: jsonSchema<DiffEditArgs>({
 		type: 'object',
 		properties: {
@@ -199,6 +351,11 @@ const diffEditCoreTool = tool({
 				type: 'string',
 				description:
 					'One or more SEARCH/REPLACE blocks using <<<<<<< SEARCH, =======, and >>>>>>> REPLACE markers. Do not wrap the diff in markdown code fences or backticks.',
+			},
+			description: {
+				type: 'string',
+				description:
+					'Optional brief summary of the intent or purpose of this edit.',
 			},
 		},
 		required: ['path', 'diff'],
@@ -235,6 +392,12 @@ function DiffEditPreview({
 	const messageContent = (
 		<Box flexDirection="column">
 			<Text color={colors.tool}>diff_edit</Text>
+			{args.description && (
+				<Box flexDirection="column">
+					<Text color={colors.secondary}>Description:</Text>
+					<Text color={colors.text}> {args.description}</Text>
+				</Box>
+			)}
 			<Box>
 				<Text color={colors.secondary}>Path: </Text>
 				<Text color={colors.text}>{args.path}</Text>
@@ -245,13 +408,31 @@ function DiffEditPreview({
 				<Text color={colors.error}>{parseError}</Text>
 			) : (
 				<Box flexDirection="column" marginTop={1}>
-					{blocks.map((block, index) => (
-						<Box key={index} flexDirection="column" marginBottom={1}>
-							<Text color={colors.secondary}>Block {index + 1}</Text>
-							<Text color={colors.error}>- {block.search}</Text>
-							<Text color={colors.success}>+ {block.replace}</Text>
-						</Box>
-					))}
+					<CappedLines
+						items={blocks.flatMap((block, index) => [
+							{
+								text: `Block ${index + 1}`,
+								color: colors.secondary,
+								changed: false,
+							},
+							...block.search.split('\n').map(line => ({
+								text: `- ${line}`,
+								color: colors.error,
+								changed: true,
+							})),
+							...block.replace.split('\n').map(line => ({
+								text: `+ ${line}`,
+								color: colors.success,
+								changed: true,
+							})),
+						])}
+						isChange={row => row.changed}
+						renderItem={(row, index) => (
+							<Text key={index} color={row.color}>
+								{row.text}
+							</Text>
+						)}
+					/>
 				</Box>
 			)}
 		</Box>
@@ -266,15 +447,14 @@ const diffEditFormatter = async (
 	args: DiffEditArgs,
 	result?: string,
 ): Promise<React.ReactElement> => {
-	const absPath = resolve(args.path);
+	const absPath = resolve(getSafeSessionCwd(), args.path);
 
 	if (result === undefined && isVSCodeConnected()) {
 		try {
 			const blocks = parseDiffEditBlocks(args.diff);
 			const cached = await getCachedFileContent(absPath);
 			const fileContent = cached.content;
-			validateBlocks(fileContent, blocks);
-			const newContent = applyBlocks(fileContent, blocks);
+			const newContent = validateBlocks(fileContent, blocks, args.path);
 			const changeId = sendFileChangeToVSCode(
 				absPath,
 				fileContent,
@@ -310,6 +490,9 @@ const diffEditValidator = async (
 	const pathResult = validatePath(args.path);
 	if (!pathResult.valid) return pathResult;
 
+	const formatResult = validateEditableFormat(args.path);
+	if (!formatResult.valid) return formatResult;
+
 	let blocks: DiffEditBlock[];
 	try {
 		blocks = parseDiffEditBlocks(args.diff);
@@ -317,7 +500,7 @@ const diffEditValidator = async (
 		return {valid: false, error: formatError(error)};
 	}
 
-	const absPath = resolve(args.path);
+	const absPath = resolve(getSafeSessionCwd(), args.path);
 	try {
 		await access(absPath, constants.F_OK);
 	} catch (error) {
@@ -338,13 +521,40 @@ const diffEditValidator = async (
 	if (!hasSeenFile(absPath)) {
 		return {
 			valid: false,
-			error: `You must read "${args.path}" before editing it. Call read_file on it first, then retry diff_edit with SEARCH blocks copied from the file.`,
+			error: `You must read "${args.path}" before editing it. Call read_file on it first — if the file is over 300 lines, specify start_line and end_line to read its actual content, not just metadata — then retry diff_edit with SEARCH blocks copied from the file.`,
 		};
 	}
 
 	try {
 		const cached = await getCachedFileContent(absPath);
-		validateBlocks(cached.content, blocks);
+		const encodingResult = validateEditableEncoding(args.path, cached);
+		if (!encodingResult.valid) return encodingResult;
+		validateBlocks(cached.content, blocks, args.path);
+
+		// Line-level visibility check: ensure the agent has actually read the lines
+		// in each SEARCH block. This prevents blind edits where the model hallucinates
+		// SEARCH content it never saw.
+		const allTargetLines: number[] = [];
+		for (const block of blocks) {
+			const blockLines = getLineNumbersForText(cached.content, block.search);
+			allTargetLines.push(...blockLines);
+		}
+
+		if (allTargetLines.length > 0) {
+			try {
+				const stats = await lstat(absPath);
+				const visibilityCheck = hasVisibleLines(absPath, stats, allTargetLines);
+				if (!visibilityCheck.visible) {
+					return {
+						valid: false,
+						error:
+							visibilityCheck.error ?? 'Lines in SEARCH blocks not visible',
+					};
+				}
+			} catch {
+				// If we can't stat the file, fall back to file-level check (already passed)
+			}
+		}
 	} catch (error) {
 		return {
 			valid: false,

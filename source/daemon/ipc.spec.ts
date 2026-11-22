@@ -1,16 +1,53 @@
 import {createConnection} from 'node:net';
-import {mkdtemp, rm} from 'node:fs/promises';
+import {mkdir, mkdtemp, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'ava';
 import type {Subscription} from '@/events/types';
 import {DaemonIpcClient, DaemonIpcServer} from './ipc';
+import {resolveSocketPath} from './lockfile';
 
 console.log(`\nipc.spec.ts`);
 
-async function makeSocketPath(): Promise<string> {
+test.serial('malformed requests leave the socket usable for a valid ping', async t => {
+	const {path, dir} = await makeSocketPath();
+	const server = new DaemonIpcServer(path, {listSubscriptions: () => []});
+	await server.start();
+	const socket = createConnection(path);
+	socket.setEncoding('utf-8');
+	t.teardown(async () => {
+		socket.destroy();
+		await server.stop();
+		await rm(dir, {recursive: true, force: true});
+	});
+	const invalid = [null, 42, 'ping', true, [], {}, {id: '1', method: 'ping'}, {id: 1, method: null}].map(value => JSON.stringify(value));
+	invalid.push('{"id":1e309,"method":"ping"}');
+	const responses = await new Promise<Array<{id: number; result?: string; error?: string}>>((resolve, reject) => {
+		let buffer = '';
+		const received: Array<{id: number; result?: string; error?: string}> = [];
+		socket.once('error', reject);
+		socket.on('data', chunk => {
+			buffer += chunk;
+			let nl: number;
+			while ((nl = buffer.indexOf('\n')) !== -1) {
+				received.push(JSON.parse(buffer.slice(0, nl)));
+				buffer = buffer.slice(nl + 1);
+			}
+			if (received.length === invalid.length + 1) resolve(received);
+		});
+		socket.once('connect', () => {
+			socket.write([...invalid, JSON.stringify({id: 7, method: 'ping'})].join('\n') + '\n');
+		});
+	});
+	t.deepEqual(responses.slice(0, -1), invalid.map(() => ({id: 0, error: 'invalid request'})));
+	t.deepEqual(responses.at(-1), {id: 7, result: 'pong'});
+});
+
+async function makeSocketPath(): Promise<{path: string; dir: string}> {
 	const dir = await mkdtemp(join(tmpdir(), 'ipc-spec-'));
-	return join(dir, 'daemon.sock');
+	await mkdir(join(dir, '.nanocoder'));
+	const path = resolveSocketPath(dir, process.platform, tmpdir());
+	return {path, dir};
 }
 
 const SAMPLE_SUB: Subscription = {
@@ -23,7 +60,7 @@ const SAMPLE_SUB: Subscription = {
 };
 
 test.serial('ping/pong round-trips through the socket', async t => {
-	const path = await makeSocketPath();
+	const {path, dir} = await makeSocketPath();
 	const server = new DaemonIpcServer(path, {
 		listSubscriptions: () => [],
 	});
@@ -35,12 +72,67 @@ test.serial('ping/pong round-trips through the socket', async t => {
 	} finally {
 		await client.disconnect();
 		await server.stop();
-		await rm(join(path, '..'), {recursive: true, force: true});
+		await rm(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('request rejects and releases the pending slot when write throws', async t => {
+	const {path, dir} = await makeSocketPath();
+	const server = new DaemonIpcServer(path, {
+		listSubscriptions: () => [],
+	});
+	await server.start();
+	const client = new DaemonIpcClient(path);
+	await client.connect();
+	try {
+		const internals = client as unknown as {
+			socket: {write: (payload: string) => boolean};
+			pending: Map<number, unknown>;
+		};
+		const write = internals.socket.write;
+		internals.socket.write = () => {
+			throw new Error('serialization failed');
+		};
+
+		try {
+			await t.throwsAsync(client.ping(), {message: 'serialization failed'});
+			t.is(internals.pending.size, 0);
+		} finally {
+			internals.socket.write = write;
+		}
+	} finally {
+		await client.disconnect();
+		await server.stop();
+		await rm(dir, {recursive: true, force: true});
+	}
+});
+
+test.serial('a closing socket rejects and drains every pending request', async t => {
+	const {path, dir} = await makeSocketPath();
+	const server = new DaemonIpcServer(path, {
+		listSubscriptions: () => [],
+	});
+	await server.start();
+	const client = new DaemonIpcClient(path);
+	await client.connect();
+	try {
+		const internals = client as unknown as {
+			socket: {destroy: () => void};
+			pending: Map<number, unknown>;
+		};
+		const inFlight = client.ping();
+		internals.socket.destroy();
+
+		await t.throwsAsync(inFlight, {message: 'IPC connection closed'});
+		t.is(internals.pending.size, 0);
+	} finally {
+		await server.stop();
+		await rm(dir, {recursive: true, force: true});
 	}
 });
 
 test.serial('listSubscriptions returns server-side list', async t => {
-	const path = await makeSocketPath();
+	const {path, dir} = await makeSocketPath();
 	const server = new DaemonIpcServer(path, {
 		listSubscriptions: () => [SAMPLE_SUB],
 	});
@@ -54,12 +146,12 @@ test.serial('listSubscriptions returns server-side list', async t => {
 	} finally {
 		await client.disconnect();
 		await server.stop();
-		await rm(join(path, '..'), {recursive: true, force: true});
+		await rm(dir, {recursive: true, force: true});
 	}
 });
 
 test.serial('unknown method returns an error response', async t => {
-	const path = await makeSocketPath();
+	const {path, dir} = await makeSocketPath();
 	const server = new DaemonIpcServer(path, {listSubscriptions: () => []});
 	await server.start();
 	const client = new DaemonIpcClient(path);
@@ -77,12 +169,12 @@ test.serial('unknown method returns an error response', async t => {
 	} finally {
 		await client.disconnect();
 		await server.stop();
-		await rm(join(path, '..'), {recursive: true, force: true});
+		await rm(dir, {recursive: true, force: true});
 	}
 });
 
 test.serial('invalid JSON returns {id:0, error:"invalid JSON"}', async t => {
-	const path = await makeSocketPath();
+	const {path, dir} = await makeSocketPath();
 	const server = new DaemonIpcServer(path, {listSubscriptions: () => []});
 	await server.start();
 	try {
@@ -100,12 +192,12 @@ test.serial('invalid JSON returns {id:0, error:"invalid JSON"}', async t => {
 		sock.destroy();
 	} finally {
 		await server.stop();
-		await rm(join(path, '..'), {recursive: true, force: true});
+		await rm(dir, {recursive: true, force: true});
 	}
 });
 
 test.serial('shutdown method calls server-side handler', async t => {
-	const path = await makeSocketPath();
+	const {path, dir} = await makeSocketPath();
 	let shutdownCalls = 0;
 	const server = new DaemonIpcServer(path, {
 		listSubscriptions: () => [],
@@ -125,14 +217,14 @@ test.serial('shutdown method calls server-side handler', async t => {
 	} finally {
 		await client.disconnect();
 		await server.stop();
-		await rm(join(path, '..'), {recursive: true, force: true});
+		await rm(dir, {recursive: true, force: true});
 	}
 });
 
 test.serial(
 	'shutdown method returns error when server has no handler',
 	async t => {
-		const path = await makeSocketPath();
+		const {path, dir} = await makeSocketPath();
 		const server = new DaemonIpcServer(path, {
 			listSubscriptions: () => [],
 			// no shutdown handler
@@ -146,7 +238,7 @@ test.serial(
 		} finally {
 			await client.disconnect();
 			await server.stop();
-			await rm(join(path, '..'), {recursive: true, force: true});
+			await rm(dir, {recursive: true, force: true});
 		}
 	},
 );
@@ -154,7 +246,7 @@ test.serial(
 test.serial(
 	'client disconnects mid-stream - server stays alive and accepts new connections',
 	async t => {
-		const path = await makeSocketPath();
+		const {path, dir} = await makeSocketPath();
 		const server = new DaemonIpcServer(path, {
 			listSubscriptions: () => [SAMPLE_SUB],
 		});
@@ -186,7 +278,7 @@ test.serial(
 			}
 		} finally {
 			await server.stop();
-			await rm(join(path, '..'), {recursive: true, force: true});
+			await rm(dir, {recursive: true, force: true});
 		}
 	},
 );

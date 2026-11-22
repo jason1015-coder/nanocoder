@@ -1,4 +1,5 @@
-import React, {useEffect} from 'react';
+import {pathToFileURL} from 'node:url';
+import React, {useEffect, useRef} from 'react';
 import {ConfigurationError, createLLMClient} from '@/client-factory';
 import {commandRegistry} from '@/commands';
 // Built-in commands are registered via a lazy registry so their modules
@@ -10,7 +11,7 @@ import {
 	InfoMessage,
 	WarningMessage,
 } from '@/components/message-box';
-import {getAppConfig, reloadAppConfig} from '@/config/index';
+import {getActiveProfile, getAppConfig, reloadAppConfig} from '@/config/index';
 import {formatConfigLintIssue, lintProviderConfigs} from '@/config/lint';
 import {loadAllProviderConfigs} from '@/config/mcp-config-loader';
 import {
@@ -23,18 +24,28 @@ import {TIMEOUT_OUTPUT_FLUSH_MS} from '@/constants';
 import {CustomCommandExecutor} from '@/custom-commands/executor';
 import {CustomCommandLoader} from '@/custom-commands/loader';
 import {resolveStartupProvider} from '@/hooks/startup-provider';
+import {setAvailableSubagents} from '@/input/prompt-processor';
 import {getLSPManager, type LSPInitResult} from '@/lsp/index';
 import {
 	setCommandLoaderGetter,
 	setToolManagerGetter,
 	setToolRegistryGetter,
 } from '@/message-handler';
-import {generateKey} from '@/session/key-generator';
-import {SubagentExecutor} from '@/subagents/subagent-executor';
+import {loadPlugins} from '@/plugins/host';
+import {
+	beginSessionStartHooks,
+	runLifecycleHooks,
+	SESSION_END_HOOK_HANDLER,
+} from '@/services/lifecycle-hooks';
+import {checkForUpdates} from '@/services/update-checker';
+import {sessionManager} from '@/session/session-manager';
+import {
+	recordSubagentApiCallForStats,
+	SubagentExecutor,
+} from '@/subagents/subagent-executor';
 import {getSubagentLoader} from '@/subagents/subagent-loader';
 import {setAgentToolExecutor, setAvailableAgentNames} from '@/tools/agent-tool';
-import {clearAllTasks} from '@/tools/tasks';
-import {ToolManager} from '@/tools/tool-manager';
+import {describeSkippedMCPTools, ToolManager} from '@/tools/tool-manager';
 import type {CustomCommand} from '@/types/commands';
 import {
 	LLMClient,
@@ -42,9 +53,8 @@ import {
 	MCPConnectionStatus,
 } from '@/types/core';
 import type {MCPInitResult, UpdateInfo, UserPreferences} from '@/types/index';
-import {setAvailableSubagents} from '@/utils/prompt-processor';
+import {generateKey} from '@/utils/key-generator';
 import {getShutdownManager} from '@/utils/shutdown';
-import {checkForUpdates} from '@/utils/update-checker';
 
 interface UseAppInitializationProps {
 	setClient: (client: LLMClient | null) => void;
@@ -83,6 +93,14 @@ interface UseAppInitializationProps {
 	 * resolve under `nanocoder run`.
 	 */
 	nonInteractiveMode?: boolean;
+	/**
+	 * Directory-trust gate. Nothing in the mount effect may run until the user
+	 * has accepted the trust disclaimer (or `--trust-directory` bypassed it):
+	 * initialization reads project-level config, resolves the provider (which
+	 * can attach a live OAuth credential to a config-supplied baseURL) and
+	 * spawns stdio MCP servers, all of which an untrusted directory controls.
+	 */
+	isTrusted: boolean;
 }
 
 export function useAppInitialization({
@@ -109,12 +127,14 @@ export function useAppInitialization({
 	cliModel,
 	nonInteractiveMode = false,
 	developmentModeRef,
+	isTrusted,
 }: UseAppInitializationProps) {
 	// Initialize LLM client and model
 	const initializeClient = async (
 		preferredProvider?: string,
 		preferredModel?: string,
 		isProgrammatic: boolean = false,
+		strictProvider: boolean = false,
 	): Promise<LLMClient | null> => {
 		// Lint provider configs before instantiation so typos and misplaced
 		// blocks surface as warnings in the chat queue, without a box —
@@ -133,6 +153,8 @@ export function useAppInitialization({
 		const {client, actualProvider} = await createLLMClient(
 			preferredProvider,
 			preferredModel,
+			undefined,
+			{strictProvider},
 		);
 		setClient(client);
 		setCurrentProvider(actualProvider);
@@ -231,9 +253,42 @@ export function useAppInitialization({
 					setMcpServersStatus([...mcpStatus]);
 				}
 			};
+			const onHealthChange = (change: {
+				serverName: string;
+				status: 'connected' | 'unhealthy';
+				error?: string;
+			}) => {
+				const statusIndex = mcpStatus.findIndex(
+					s => s.name === change.serverName,
+				);
+				if (statusIndex === -1) return;
+				mcpStatus[statusIndex] = {
+					name: change.serverName,
+					status: change.status === 'connected' ? 'connected' : 'unhealthy',
+					errorMessage: change.error,
+				};
+				setMcpServersStatus([...mcpStatus]);
+			};
 
 			try {
-				await toolManager.initializeMCP(config.mcpServers, onProgress);
+				const results = await toolManager.initializeMCP(
+					config.mcpServers,
+					onProgress,
+					onHealthChange,
+					config.tune,
+				);
+				for (const result of results) {
+					const warning = describeSkippedMCPTools(result);
+					if (warning) {
+						addToChatQueue(
+							<WarningMessage
+								key={generateKey(`mcp-skipped-tools-${result.serverName}`)}
+								message={warning}
+								hideBox={true}
+							/>,
+						);
+					}
+				}
 			} catch (error) {
 				// Mark all pending servers as failed
 				mcpStatus.forEach((status, index) => {
@@ -259,9 +314,10 @@ export function useAppInitialization({
 	// Initialize LSP servers with auto-discovery
 	const initializeLSPServers = async () => {
 		const lspConfig = getAppConfig();
+		const autoDiscover = lspConfig.lsp?.autoDiscover !== false;
 		const lspManager = await getLSPManager({
-			rootUri: `file://${process.cwd()}`,
-			autoDiscover: true,
+			rootUri: pathToFileURL(process.cwd()).href,
+			autoDiscover,
 			// Use custom servers from config if provided
 			servers: lspConfig.lspServers?.map(server => ({
 				name: server.name,
@@ -319,7 +375,7 @@ export function useAppInitialization({
 
 		try {
 			await lspManager.initialize({
-				autoDiscover: true,
+				autoDiscover,
 				servers: lspConfig.lspServers?.map(server => ({
 					name: server.name,
 					command: server.command,
@@ -366,8 +422,14 @@ export function useAppInitialization({
 			const currentMode = developmentModeRef?.current || 'normal';
 			const modeConfig = config.modeProviders?.[currentMode];
 
-			// Use CLI provider/model if provided, otherwise mode-specific, otherwise preferences
-			const isProgrammatic = !(cliProvider || cliModel) && !!modeConfig;
+			const activeProfile = getActiveProfile();
+			const profileProvider = activeProfile?.provider;
+			const profileModel = activeProfile?.model;
+
+			// Use CLI provider/model if provided, otherwise profile, otherwise mode-specific, otherwise preferences
+			const isProgrammatic =
+				!(cliProvider || cliModel) &&
+				!!(profileProvider || profileModel || modeConfig);
 			// A saved/mode provider can go stale (renamed or removed from
 			// agents.config.json). Passing it through would make createLLMClient
 			// throw and strand the app on an error screen with no client. Fall
@@ -380,6 +442,7 @@ export function useAppInitialization({
 				modeConfig?.provider,
 				preferences.lastProvider,
 				configuredNames,
+				profileProvider,
 			);
 			if (staleName) {
 				addToChatQueue(
@@ -390,12 +453,23 @@ export function useAppInitialization({
 					/>,
 				);
 			}
-			const model = cliModel || modeConfig?.model || undefined;
-			const client = await initializeClient(provider, model, isProgrammatic);
+			const model = cliModel || profileModel || modeConfig?.model || undefined;
+			const client = await initializeClient(
+				provider,
+				model,
+				isProgrammatic,
+				Boolean(cliProvider),
+			);
 
 			// Create and initialize the SubagentExecutor if client was successfully created
 			if (client) {
-				const executor = new SubagentExecutor(toolManager, client);
+				const executor = new SubagentExecutor(
+					toolManager,
+					client,
+					process.cwd(),
+					'normal',
+					recordSubagentApiCallForStats,
+				);
 				// Read the live development mode per tool call so subagents honor
 				// the current mode (and mid-run switches), matching the main loop.
 				if (developmentModeRef) {
@@ -556,15 +630,28 @@ export function useAppInitialization({
 		}
 	};
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: Initialization effect should only run once on mount
+	// Guards the trust-gated effect below so it initializes exactly once, even
+	// though it now re-runs when `isTrusted` flips from false to true.
+	const hasInitializedRef = useRef(false);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Initialization effect should only run once, on the first render where the directory is trusted
 	useEffect(() => {
+		// The trust disclaimer is a JSX early return in App.tsx, which does not
+		// stop hooks from running — so the gate has to live inside the effect.
+		// Until the directory is trusted, read nothing from it and spawn nothing.
+		if (!isTrusted || hasInitializedRef.current) return;
+		hasInitializedRef.current = true;
+
 		const initializeApp = async () => {
 			setClient(null);
 			setCurrentModel('');
 			setCurrentProviderConfig(null);
 
-			// Clear task list — fire-and-forget, just deletes a JSON file
-			void clearAllTasks();
+			// Reclaim artifact directories left behind by sessions that no longer
+			// exist — /clear retires a session id every time, and with autosave off
+			// no session file is ever written for the session-delete path to catch.
+			// Fire-and-forget: housekeeping must never delay or break startup.
+			void sessionManager.cleanupOrphanedArtifacts();
 
 			const newToolManager = new ToolManager();
 			const newCustomCommandLoader = new CustomCommandLoader();
@@ -592,6 +679,22 @@ export function useAppInitialization({
 
 			commandRegistry.registerLazy(lazyCommands);
 
+			// Lifecycle hooks: session-start output is buffered as context for the
+			// next prompt (so `git log -5` reaches the model without the user
+			// asking), and session-end runs through the shutdown manager at
+			// priority -5 — after the session autosave flush (-10), before the
+			// TUI teardown (0), while the process is still fully alive.
+			getShutdownManager().register({
+				name: SESSION_END_HOOK_HANDLER,
+				priority: -5,
+				handler: async () => {
+					await runLifecycleHooks('session-end');
+				},
+			});
+			// Not awaited: a slow session-start hook must not hold up the UI. The
+			// first prompt waits for it instead, when it drains the buffer.
+			void beginSessionStartHooks();
+
 			// === CRITICAL PATH ===
 			// LLM client + subagents are independent — run in parallel.
 			// Everything else (update check, MCP, LSP) runs in the background.
@@ -615,6 +718,10 @@ export function useAppInitialization({
 			// so nothing gates on MCP/LSP/update-check completing. Show
 			// the prompt immediately after the LLM client + subagents are
 			// ready. Everything else connects in the background.
+			// Wait so the first prompt sees plugins. Trust is not revoked
+			// during a session; if it ever is, this load has to be undone
+			// or the plugins stay active after the revoke.
+			await loadPlugins(true);
 			setMcpInitialized(true);
 			setStartChat(true);
 
@@ -633,7 +740,7 @@ export function useAppInitialization({
 		};
 
 		void initializeApp();
-	}, []);
+	}, [isTrusted]);
 
 	return {
 		initializeClient,

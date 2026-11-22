@@ -4,7 +4,8 @@ import React from 'react';
 import {themes} from '../config/themes';
 import {ThemeContext} from '../hooks/useTheme';
 import type {Message} from '../types/core';
-import {resetKeyGeneratorForTests} from './key-generator';
+import {resetKeyGeneratorForTests} from '../utils/key-generator';
+import {appendTurnContext} from '../utils/turn-context';
 import {buildSessionHistoryComponents} from './session-history-renderer';
 
 function TestThemeProvider({children}: {children: React.ReactNode}) {
@@ -46,6 +47,20 @@ test('renders user prompts and assistant replies', t => {
 	t.regex(output, /fix the parser bug/);
 	t.regex(output, /looking into the parser/);
 	t.notRegex(output, /system prompt that should not appear/);
+});
+
+test('does not replay internal walkthrough fallback messages', t => {
+	const output = renderHistory([
+		{
+			role: 'user',
+			content:
+				'<nanocoder-internal-walkthrough>call write_walkthrough</nanocoder-internal-walkthrough>',
+		},
+		{role: 'assistant', content: 'Walkthrough saved.'},
+	]);
+
+	t.notRegex(output, /nanocoder-internal-walkthrough|call write_walkthrough/);
+	t.regex(output, /Walkthrough saved/);
 });
 
 test('renders tool calls as compact summaries paired with results', t => {
@@ -138,4 +153,23 @@ test('renders assistant reasoning collapsed', t => {
 	t.regex(output, /Thought/);
 	// Collapsed: the reasoning body itself is not shown.
 	t.notRegex(output, /secret approach/);
+});
+
+test('replays the user prompt without its per-turn context block', t => {
+	// The block is harness-authored, not something the user typed, but it stays
+	// in the stored message so a resumed session re-sends the identical bytes
+	// and keeps the cached prefix warm (#1574).
+	const output = renderHistory([
+		{
+			role: 'user',
+			content: appendTurnContext('fix the parser bug', [
+				'## Project Context\n\n```\n- Parser uses a hand-rolled lexer.\n```',
+			]),
+		},
+		{role: 'assistant', content: 'On it.'},
+	]);
+
+	t.regex(output, /fix the parser bug/);
+	t.notRegex(output, /turn-context|Project Context|hand-rolled lexer/);
+	t.regex(output, /On it/);
 });

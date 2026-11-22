@@ -1,18 +1,36 @@
-import React from 'react';
-import {ModelDatabaseDisplay} from '@/commands/model-database';
+import React, {Suspense} from 'react';
 import CheckpointSelector from '@/components/checkpoint-selector';
 import ModelSelector from '@/components/model-selector';
 import SessionSelector from '@/components/session-selector';
 import type {ActiveMode} from '@/hooks/useAppState';
 import type {CheckpointListItem, TuneConfig} from '@/types';
-import {McpWizard} from '@/wizards/mcp-wizard';
 import {ProviderWizard} from '@/wizards/provider-wizard';
-import {SettingsSelector} from './settings-tabs';
+import type {SettingsTabId} from './settings-constants';
+import {SettingsSelector} from './settings-selector';
 import {TuneSelector} from './tune-selector';
 
+/**
+ * `@/commands/model-database` must stay out of the startup module graph: it
+ * pulls the model fetcher and, transitively, the clipboard chain into every
+ * session even though the modal is only reachable from the `/model-database`
+ * command. Load it on first render instead — `React.lazy` caches the module,
+ * so reopening the modal afterwards is synchronous. See #1775.
+ */
+const ModelDatabaseDisplay = React.lazy(() =>
+	import('@/commands/model-database').then(mod => ({
+		default: mod.ModelDatabaseDisplay,
+	})),
+);
+
 export interface ModalSelectorsProps {
+	onLaunchTune?: () => void;
+	onLaunchIde?: () => void;
+	onMcpChanged?: () => void | Promise<void>;
+	onProvidersChanged?: () => void | Promise<void>;
 	activeMode: ActiveMode;
 	isSettingsMode: boolean;
+	settingsInitialTab?: SettingsTabId;
+	onSettingsTabChange?: (tab: SettingsTabId) => void;
 	showAllSessions: boolean;
 
 	// Current values
@@ -33,10 +51,6 @@ export interface ModalSelectorsProps {
 	// Handlers - Config Wizard
 	onConfigWizardComplete: (configPath: string) => Promise<void>;
 	onConfigWizardCancel: () => void;
-
-	// Handlers - MCP Wizard
-	onMcpWizardComplete: (configPath: string) => Promise<void>;
-	onMcpWizardCancel: () => void;
 
 	// Handlers - Checkpoint
 	onCheckpointSelect: (name: string, backup: boolean) => Promise<void>;
@@ -62,6 +76,8 @@ export interface ModalSelectorsProps {
 export function ModalSelectors({
 	activeMode,
 	isSettingsMode,
+	settingsInitialTab,
+	onSettingsTabChange,
 	showAllSessions,
 	currentModel,
 	currentProvider,
@@ -71,13 +87,15 @@ export function ModalSelectors({
 	onModelDatabaseCancel,
 	onConfigWizardComplete,
 	onConfigWizardCancel,
-	onMcpWizardComplete,
-	onMcpWizardCancel,
 	onCheckpointSelect,
 	onCheckpointCancel,
 	onSessionSelect,
 	onSessionCancel,
 	onSettingsCancel,
+	onLaunchTune,
+	onLaunchIde,
+	onMcpChanged,
+	onProvidersChanged,
 	tuneConfig,
 	onTuneSelect,
 	onTuneCancel,
@@ -97,6 +115,7 @@ export function ModalSelectors({
 		return (
 			<TuneSelector
 				currentConfig={tuneConfig}
+				currentModel={currentModel}
 				onSelect={config => void onTuneSelect(config)}
 				onCancel={onTuneCancel}
 			/>
@@ -104,11 +123,29 @@ export function ModalSelectors({
 	}
 
 	if (isSettingsMode) {
-		return <SettingsSelector onCancel={onSettingsCancel} />;
+		return (
+			<SettingsSelector
+				onCancel={onSettingsCancel}
+				onLaunchTune={onLaunchTune}
+				onLaunchIde={onLaunchIde}
+				onMcpChanged={onMcpChanged}
+				onProvidersChanged={onProvidersChanged}
+				initialTab={settingsInitialTab}
+				onTabChange={onSettingsTabChange}
+			/>
+		);
 	}
 
 	if (activeMode === 'modelDatabase') {
-		return <ModelDatabaseDisplay onCancel={onModelDatabaseCancel} />;
+		return (
+			<Suspense fallback={null}>
+				<ModelDatabaseDisplay
+					onCancel={onModelDatabaseCancel}
+					currentProvider={currentProvider}
+					onModelSelect={onModelSelect}
+				/>
+			</Suspense>
+		);
 	}
 
 	if (activeMode === 'configWizard') {
@@ -117,16 +154,6 @@ export function ModalSelectors({
 				projectDir={process.cwd()}
 				onComplete={configPath => void onConfigWizardComplete(configPath)}
 				onCancel={onConfigWizardCancel}
-			/>
-		);
-	}
-
-	if (activeMode === 'mcpWizard') {
-		return (
-			<McpWizard
-				projectDir={process.cwd()}
-				onComplete={configPath => void onMcpWizardComplete(configPath)}
-				onCancel={onMcpWizardCancel}
 			/>
 		);
 	}

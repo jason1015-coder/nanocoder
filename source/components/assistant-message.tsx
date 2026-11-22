@@ -4,9 +4,10 @@ import {useNonInteractiveRender} from '@/hooks/useNonInteractiveRender';
 import {useTerminalWidth} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
 import {parseMarkdownParts} from '@/markdown-parser/index';
+import {wrapWithTrimmedContinuations} from '@/terminal/text-wrapping';
 import type {AssistantMessageProps} from '@/types/index';
-import {wrapWithTrimmedContinuations} from '@/utils/text-wrapping';
-import {calculateTokens} from '@/utils/token-calculator';
+import {formatUsageIndicator} from '@/usage/format';
+import {estimateTokens} from '@/utils/token-calculator';
 
 export function AssistantMessageBox({
 	text,
@@ -22,9 +23,8 @@ export function AssistantMessageBox({
 		<Box
 			flexDirection="column"
 			marginBottom={1}
-			backgroundColor={colors.base}
 			width={boxWidth}
-			padding={1}
+			paddingX={1}
 			borderStyle="bold"
 			borderLeft={true}
 			borderRight={false}
@@ -41,11 +41,17 @@ export function AssistantMessageBox({
 export default memo(function AssistantMessage({
 	message,
 	model,
+	usage,
+	showUsageFooter = true,
 }: AssistantMessageProps) {
 	const {colors} = useTheme();
 	const boxWidth = useTerminalWidth();
 	const nonInteractive = useNonInteractiveRender();
-	const tokens = calculateTokens(message);
+	const tokens = estimateTokens(message);
+	// Prefer the provider-reported usage (real token counts + cost); fall
+	// back to the client-side estimate of the message text when the
+	// provider reported nothing.
+	const usageIndicator = usage ? formatUsageIndicator(usage) : null;
 
 	// Inner text width: outer width minus left border (1) and padding (1 each side)
 	const textWidth = nonInteractive ? boxWidth : boxWidth - 3;
@@ -101,7 +107,7 @@ export default memo(function AssistantMessage({
 
 	return (
 		<>
-			<Box marginBottom={1} marginTop={1}>
+			<Box marginTop={1}>
 				<Text color={colors.info} bold>
 					{model}:
 				</Text>
@@ -117,9 +123,17 @@ export default memo(function AssistantMessage({
 					</Box>
 				),
 			)}
-			<Box marginBottom={2}>
-				<Text color={colors.secondary}>~{tokens.toLocaleString()} tokens</Text>
-			</Box>
+			{showUsageFooter ? (
+				<Box marginBottom={2}>
+					<Text color={colors.secondary}>
+						{usageIndicator ?? `~${tokens.toLocaleString()} tokens`}
+					</Text>
+				</Box>
+			) : (
+				// Keep the trailing gap the footer used to provide, so turning
+				// the footer off doesn't visually cram messages together.
+				<Box marginBottom={1} />
+			)}
 		</>
 	);
 });

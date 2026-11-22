@@ -1,10 +1,16 @@
-import {mkdirSync, rmSync, writeFileSync} from 'node:fs';
-import {join} from 'node:path';
+import {mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join, parse as parsePath} from 'node:path';
 import test from 'ava';
 import {render} from 'ink-testing-library';
 import React from 'react';
 import {themes} from '../config/themes';
 import {ThemeContext} from '../hooks/useTheme';
+import {
+	resetSessionCwd,
+	setProjectRoot,
+	setSessionCwd,
+} from '../services/session-cwd';
 import {searchFileContentsTool} from './search-file-contents';
 
 // ============================================================================
@@ -757,10 +763,13 @@ test.serial(
 				// Count x's in result - should be 300 - 12 (searchTarget) = 288
 				const contentLine = result.split('\n').find(l => l.includes('searchTarget'));
 				t.truthy(contentLine, 'Should have content line');
-				// The trimmed content should be max 300 chars + ellipsis
-				const trimmedContent = contentLine!.trim();
+				// Content follows the `file:line:` prefix in grep-style output;
+				// strip it before checking the truncated length.
+				const contentMatch = contentLine!.match(/^.+?:\d+:(.*)$/);
+				t.truthy(contentMatch, 'Content line should be in file:line:content format');
+				const trimmedContent = contentMatch![1];
 				t.true(
-					trimmedContent.length <= 302, // 300 + ellipsis (1 char) + possible whitespace
+					trimmedContent.length <= 301, // 300 + ellipsis (1 char)
 					`Content should be truncated, got ${trimmedContent.length} chars`,
 				);
 			} finally {
@@ -1726,6 +1735,91 @@ test.serial(
 );
 
 test.serial(
+	'search_file_contents separates context-free matches with a single newline',
+	async t => {
+		t.timeout(10000);
+		const testDir = join(process.cwd(), 'test-search-compact-temp');
+
+		try {
+			mkdirSync(testDir, {recursive: true});
+			writeFileSync(
+				join(testDir, 'test.ts'),
+				'TARGET_MATCH one\nfiller\nTARGET_MATCH two\nfiller\nTARGET_MATCH three',
+			);
+
+			const originalCwd = process.cwd();
+
+			try {
+				process.chdir(testDir);
+
+				const result = await searchFileContentsTool.tool.execute!(
+					{query: 'TARGET_MATCH', maxResults: 30},
+					{toolCallId: 'test', messages: []},
+				);
+
+				// Only the header/body split should produce a blank line; the
+				// match list itself must not contain any.
+				const sections = result.split('\n\n');
+				t.is(sections.length, 2, `Expected one blank line, got: ${result}`);
+				t.true(
+					sections[0].startsWith('Found 3 matches'),
+					'Header should report three matches',
+				);
+
+				const lines = sections[1].split('\n');
+				t.is(lines.length, 3, 'Each match should occupy exactly one line');
+				for (const line of lines) {
+					t.regex(line, /^test\.ts:\d+:TARGET_MATCH/, 'Expected file:line:content');
+				}
+			} finally {
+				process.chdir(originalCwd);
+			}
+		} finally {
+			rmSync(testDir, {recursive: true, force: true});
+		}
+	},
+);
+
+test.serial(
+	'search_file_contents keeps the context header separator when a context block is one line',
+	async t => {
+		t.timeout(10000);
+		const testDir = join(process.cwd(), 'test-search-single-line-temp');
+
+		try {
+			mkdirSync(testDir, {recursive: true});
+			// A single-line file collapses the context block to one line, so
+			// content-sniffing would misread it as an exact match.
+			writeFileSync(join(testDir, 'test.ts'), 'const TARGET_MATCH = 1;');
+
+			const originalCwd = process.cwd();
+
+			try {
+				process.chdir(testDir);
+
+				const result = await searchFileContentsTool.tool.execute!(
+					{query: 'TARGET_MATCH', contextLines: 3, maxResults: 30},
+					{toolCallId: 'test', messages: []},
+				);
+
+				t.true(
+					result.includes('test.ts:1-\n'),
+					`Context block should use the "-" header, got: ${result}`,
+				);
+				t.false(
+					result.includes('test.ts:1:1:'),
+					'Should not emit the exact-match header with a doubled line number',
+				);
+			} finally {
+				process.chdir(originalCwd);
+			}
+		} finally {
+			rmSync(testDir, {recursive: true, force: true});
+		}
+	},
+);
+
+test.serial(
 	'search_file_contents clamps contextLines to max 10',
 	async t => {
 		t.timeout(10000);
@@ -1835,6 +1929,86 @@ test.serial(
 // Tests for Formatter with New Parameters
 // ============================================================================
 
+test.serial(
+	'search_file_contents clamps to the project root when the session cwd escaped it',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-proj-'));
+		const outside = mkdtempSync(join(tmpdir(), 'nc-outside-'));
+		try {
+			writeFileSync(join(root, 'inproject.txt'), 'needle_marker here');
+			writeFileSync(join(outside, 'secret.txt'), 'needle_marker here');
+			setProjectRoot(root);
+			setSessionCwd(outside); // like a bash `cd /etc`
+			const result = await searchFileContentsTool.tool.execute!(
+				{query: 'needle_marker', maxResults: 30},
+				{toolCallId: 'test', messages: []},
+			);
+			t.true(result.includes('inproject.txt'), 'searches the project root');
+			t.false(
+				result.includes('secret.txt'),
+				'does not escape to the session cwd',
+			);
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+			rmSync(outside, {recursive: true, force: true});
+		}
+	},
+);
+
+test.serial(
+	'search_file_contents accepts an absolute path when the project root is a filesystem root',
+	async t => {
+		// Containers mount the workspace at `/`, so the project root is `/` (or a
+		// drive root on Windows). The containment prefix must not become `//`. See #1240.
+		const root = parsePath(process.cwd()).root;
+		const dir = mkdtempSync(join(tmpdir(), 'nc-fsroot-'));
+		try {
+			writeFileSync(join(dir, 'found.txt'), 'fsroot_needle here');
+			setProjectRoot(root);
+			setSessionCwd(dir);
+			const result = await searchFileContentsTool.tool.execute!(
+				{query: 'fsroot_needle', path: dir, maxResults: 30},
+				{toolCallId: 'test', messages: []},
+			);
+			t.false(
+				result.includes('escapes project directory'),
+				'a path under the filesystem root is contained',
+			);
+			t.true(result.includes('found.txt'), 'searches the requested path');
+		} finally {
+			resetSessionCwd();
+			rmSync(dir, {recursive: true, force: true});
+		}
+	},
+);
+
+(process.platform === 'win32' ? test.serial.skip : test.serial)(
+	'search_file_contents rejects a path through an in-project symlink that points outside',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-search-root-'));
+		const outside = mkdtempSync(join(tmpdir(), 'nc-search-outside-'));
+		try {
+			writeFileSync(join(outside, 'secret.txt'), 'symlink_needle secret');
+			// Lexically `link` is inside the project, but ripgrep follows a
+			// symlink named on its command line, so it would grep `outside`.
+			symlinkSync(outside, join(root, 'link'));
+			setProjectRoot(root);
+			setSessionCwd(root);
+			const result = await searchFileContentsTool.tool.execute!(
+				{query: 'symlink_needle', path: 'link', maxResults: 30},
+				{toolCallId: 'test', messages: []},
+			);
+			t.regex(result, /escapes project directory/);
+			t.false(result.includes('secret.txt'));
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+			rmSync(outside, {recursive: true, force: true});
+		}
+	},
+);
+
 test('SearchFileContentsFormatter shows wholeWord indicator', t => {
 	const formatter = searchFileContentsTool.formatter;
 	if (!formatter) {
@@ -1888,4 +2062,43 @@ test('SearchFileContentsFormatter hides context when 0', t => {
 	const output = lastFrame();
 	t.truthy(output);
 	t.notRegex(output!, /Context:/);
+});
+
+test('SearchFileContentsFormatter lists the file:line hits', t => {
+	const formatter = searchFileContentsTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter is not defined');
+		return;
+	}
+
+	const element = formatter(
+		{query: 'handleSubmit'},
+		'Found 2 matches:\n\nsrc/form.ts:3:handleSubmit()\nsrc/app.ts:9:const handleSubmit = 1;',
+	);
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+
+	const output = lastFrame()!;
+	t.regex(output, /src\/form\.ts:3:handleSubmit\(\)/);
+	t.regex(output, /src\/app\.ts:9:const handleSubmit = 1;/);
+	t.notRegex(output, /more lines/);
+});
+
+test('SearchFileContentsFormatter caps a long hit list like bash output', t => {
+	const formatter = searchFileContentsTool.formatter;
+	if (!formatter) {
+		t.fail('Formatter is not defined');
+		return;
+	}
+
+	const hits = Array.from(
+		{length: 25},
+		(_, i) => `src/file${i + 1}.ts:1:match`,
+	).join('\n');
+	const element = formatter({query: 'match'}, `Found 25 matches:\n\n${hits}`);
+	const {lastFrame} = render(<TestThemeProvider>{element}</TestThemeProvider>);
+
+	const output = lastFrame()!;
+	t.regex(output, /src\/file20\.ts:1:match/);
+	t.notRegex(output, /src\/file21\.ts/);
+	t.regex(output, /\+5 more lines/);
 });

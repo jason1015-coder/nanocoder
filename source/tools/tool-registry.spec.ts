@@ -454,3 +454,84 @@ test('ToolRegistry - fromRegistries skips tools without matching handlers', t =>
 	t.true(registry.hasTool('tool1'));
 	t.false(registry.hasTool('tool2'));
 });
+
+test('ToolRegistry - fromToolExports forwards the abort signal to execute', async t => {
+	let seen: AbortSignal | undefined;
+	const controller = new AbortController();
+
+	// inputSchema.jsonSchema is what every real tool export carries, so this is
+	// the wrapped-by-validation path: if the wrapper drops its options, Stop
+	// stops reaching long-running tools (agent, execute_bash) entirely.
+	const registry = ToolRegistry.fromToolExports([
+		{
+			name: 'slow-tool',
+			tool: {
+				inputSchema: {
+					jsonSchema: {
+						type: 'object',
+						properties: { path: { type: 'string' } },
+					},
+				},
+				execute: async (_args: unknown, opts: { abortSignal?: AbortSignal }) => {
+					seen = opts?.abortSignal;
+					return 'done';
+				},
+			} as any,
+		},
+	]);
+
+	const handler = registry.getHandler('slow-tool');
+	t.truthy(handler);
+	await handler?.({ path: 'a.ts' }, { abortSignal: controller.signal });
+	t.is(seen, controller.signal);
+});
+
+// ============================================================================
+// Layered registries (a session's tools over the shared set)
+// ============================================================================
+
+test('ToolRegistry - a layered registry reads its parent live and adds its own tools', t => {
+	const parent = new ToolRegistry();
+	parent.register(createMockToolEntry({name: 'shared'}));
+	const layer = new ToolRegistry(parent);
+	layer.register(createMockToolEntry({name: 'own'}));
+
+	t.deepEqual(layer.getToolNames().sort(), ['own', 'shared']);
+	t.is(layer.getToolCount(), 2);
+	t.true(layer.hasTool('shared'));
+	t.deepEqual(Object.keys(layer.getHandlers()).sort(), ['own', 'shared']);
+	t.deepEqual(Object.keys(layer.getNativeTools()).sort(), ['own', 'shared']);
+
+	// A tool the parent gains later is visible without re-copying anything.
+	parent.register(createMockToolEntry({name: 'later'}));
+	t.true(layer.hasTool('later'));
+	parent.unregister('shared');
+	t.false(layer.hasTool('shared'));
+});
+
+test('ToolRegistry - the parent never sees a layer\'s tools, and the layer cannot remove the parent\'s', t => {
+	const parent = new ToolRegistry();
+	parent.register(createMockToolEntry({name: 'shared'}));
+	const layer = new ToolRegistry(parent);
+	layer.register(createMockToolEntry({name: 'own'}));
+
+	t.false(parent.hasTool('own'));
+	t.is(parent.getToolCount(), 1);
+
+	layer.unregister('shared');
+	layer.clear();
+	t.true(parent.hasTool('shared'));
+	t.true(layer.hasTool('shared'));
+	t.false(layer.hasTool('own'));
+});
+
+test('ToolRegistry - a layer\'s own tool wins over the parent\'s of the same name', t => {
+	const parent = new ToolRegistry();
+	parent.register(createMockToolEntry({name: 'same', readOnly: false}));
+	const layer = new ToolRegistry(parent);
+	layer.register(createMockToolEntry({name: 'same', readOnly: true}));
+
+	t.true(layer.getEntry('same')?.readOnly);
+	t.false(parent.getEntry('same')?.readOnly);
+	t.is(layer.getToolCount(), 1);
+});

@@ -1,15 +1,35 @@
 import {constants} from 'node:fs';
-import {access, writeFile} from 'node:fs/promises';
+import {access, lstat} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import React from 'react';
 import {getColors} from '@/config/index';
+import {
+	enforceFirewall,
+	evaluateMutationEnvelope,
+} from '@/firewall/mutation-firewall';
+import {getSafeSessionCwd} from '@/services/session-cwd';
+import {EditRecoveryError} from '@/tools/file-ops/edit-recovery';
+import {fitEditToLineEndings} from '@/tools/file-ops/line-endings';
+import {replaceFirstLiteral} from '@/tools/file-ops/literal-replace';
+import {
+	validateEditableEncoding,
+	validateEditableFormat,
+	validatePath,
+} from '@/tools/file-ops/path-validators';
+import {
+	forgetReadContent,
+	getLineNumbersForText,
+	hasSeenFile,
+	hasVisibleLines,
+	markFileSeen,
+	recordEditVisibility,
+} from '@/tools/runtime/read-tracker';
+import {createFileToolApproval} from '@/tools/runtime/tool-approval';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {getCachedFileContent, invalidateCache} from '@/utils/file-cache';
-import {validatePath} from '@/utils/path-validators';
-import {hasSeenFile, markFileSeen} from '@/utils/read-tracker';
-import {createFileToolApproval} from '@/utils/tool-approval';
+import {atomicWriteUserFile} from '@/utils/fs/atomic-write';
+import {getCachedFileContent, invalidateCache} from '@/utils/fs/file-cache';
 import {
 	closeDiffInVSCode,
 	isVSCodeConnected,
@@ -22,28 +42,93 @@ interface StringReplaceArgs {
 	path: string;
 	old_str: string;
 	new_str: string;
+	description?: string;
+}
+
+const STRING_REPLACE_CONTEXT_LINES = 20;
+
+// The schema marks new_str as required, but a model can still send a call
+// without it. Without this check, `undefined` reaches the replacement and the
+// literal text "undefined" is written into the file. An empty string is valid:
+// it deletes old_str.
+const NEW_STR_REQUIRED_ERROR =
+	'new_str is required and must be a string. Use an empty string ("") to delete text.';
+
+function formatUpdatedFileContext(
+	content: string,
+	startLine: number,
+	endLine: number,
+): string {
+	const lines = content.split('\n');
+	const contextStartLine = Math.max(
+		1,
+		startLine - STRING_REPLACE_CONTEXT_LINES,
+	);
+	const contextEndLine = Math.min(
+		lines.length,
+		endLine + STRING_REPLACE_CONTEXT_LINES,
+	);
+
+	let fileContext = `\n\nUpdated file context (lines ${contextStartLine}-${contextEndLine} of ${lines.length}):\n`;
+	if (contextStartLine > 1) {
+		fileContext += `[... lines 1-${contextStartLine - 1} omitted ...]\n`;
+	}
+
+	for (let i = contextStartLine - 1; i < contextEndLine; i++) {
+		const lineNumStr = String(i + 1).padStart(4, ' ');
+		fileContext += `${lineNumStr}: ${lines[i] || ''}\n`;
+	}
+
+	if (contextEndLine < lines.length) {
+		fileContext += `[... lines ${contextEndLine + 1}-${lines.length} omitted ...]\n`;
+	}
+
+	return fileContext;
 }
 
 const executeStringReplace = async (
 	args: StringReplaceArgs,
 ): Promise<string> => {
-	const {path, old_str, new_str} = args;
+	const {path} = args;
 
-	if (!old_str || old_str.length === 0) {
+	if (!args.old_str || args.old_str.length === 0) {
 		throw new Error(
 			'old_str cannot be empty. Provide the exact content to find and replace.',
 		);
 	}
 
-	const absPath = resolve(path);
+	// Checked again here (not only in the validator) so the file is never
+	// written when execute is reached without validation.
+	if (typeof args.new_str !== 'string') {
+		throw new Error(NEW_STR_REQUIRED_ERROR);
+	}
+
+	const formatResult = validateEditableFormat(path);
+	if (!formatResult.valid) {
+		throw new Error(formatResult.error);
+	}
+
+	const absPath = resolve(getSafeSessionCwd(), path);
 	const cached = await getCachedFileContent(absPath);
+	const encodingResult = validateEditableEncoding(path, cached);
+	if (!encodingResult.valid) {
+		throw new Error(encodingResult.error);
+	}
 	const fileContent = cached.content;
+	const {oldStr: old_str, newStr: new_str} = fitEditToLineEndings(
+		fileContent,
+		args.old_str,
+		args.new_str,
+	);
 
 	const occurrences = fileContent.split(old_str).length - 1;
 
 	if (occurrences === 0) {
-		throw new Error(
+		throw new EditRecoveryError(
 			`Content not found in file. The file may have changed since you last read it.\n`,
+			path,
+			fileContent,
+			old_str,
 		);
 	}
 
@@ -53,39 +138,47 @@ const executeStringReplace = async (
 		);
 	}
 
-	const newContent = fileContent.replace(old_str, new_str);
-	await writeFile(absPath, newContent, 'utf-8');
+	const newContent = replaceFirstLiteral(fileContent, old_str, new_str);
+	const firewallResult = evaluateMutationEnvelope(
+		path,
+		fileContent,
+		newContent,
+	);
+	const firewallWarning = enforceFirewall(firewallResult);
+
+	await atomicWriteUserFile(absPath, newContent);
 	invalidateCache(absPath);
 	// The model now knows the file's current contents, so a follow-up edit is
 	// not blind.
 	markFileSeen(absPath);
+	forgetReadContent(absPath);
+	// The agent just wrote this range, so it counts as seen. The edit changed
+	// the file's mtime/size and may have moved the lines below it, so carry the
+	// rest of what the agent had read forward instead of forgetting it.
+	try {
+		const stats = await lstat(absPath);
+		const editStart = fileContent
+			.slice(0, fileContent.indexOf(old_str))
+			.split('\n').length;
+		recordEditVisibility(
+			absPath,
+			stats,
+			editStart,
+			old_str.split('\n').length,
+			new_str.split('\n').length,
+		);
+	} catch {
+		// If stat fails, fall back to file-level tracking only
+	}
 
-	const beforeLines = fileContent.split('\n');
 	const oldStrLines = old_str.split('\n');
 	const newStrLines = new_str.split('\n');
 
-	let startLine = 0;
-	let searchIndex = 0;
-	for (let i = 0; i < beforeLines.length; i++) {
-		const lineWithNewline =
-			beforeLines[i] + (i < beforeLines.length - 1 ? '\n' : '');
-		if (fileContent.indexOf(old_str, searchIndex) === searchIndex) {
-			startLine = i + 1;
-			break;
-		}
-		searchIndex += lineWithNewline.length;
-	}
+	const matchIndex = fileContent.indexOf(old_str);
+	const startLine = fileContent.slice(0, matchIndex).split('\n').length;
 
 	const endLine = startLine + oldStrLines.length - 1;
 	const newEndLine = startLine + newStrLines.length - 1;
-
-	const newLines = newContent.split('\n');
-	let fileContext = '\n\nUpdated file contents:\n';
-	for (let i = 0; i < newLines.length; i++) {
-		const lineNumStr = String(i + 1).padStart(4, ' ');
-		const line = newLines[i] || '';
-		fileContext += `${lineNumStr}: ${line}\n`;
-	}
 
 	const rangeDesc =
 		startLine === endLine
@@ -96,12 +189,12 @@ const executeStringReplace = async (
 			? `line ${startLine}`
 			: `lines ${startLine}-${newEndLine}`;
 
-	return `Successfully replaced content at ${rangeDesc} (now ${newRangeDesc}).${fileContext}`;
+	return `Successfully replaced content at ${rangeDesc} (now ${newRangeDesc}).${formatUpdatedFileContext(newContent, startLine, newEndLine)}${firewallWarning}`;
 };
 
 const stringReplaceCoreTool = tool({
 	description:
-		'Replace exact string content in a file. IMPORTANT: Provide exact content including whitespace and surrounding context. For unique matching, include 2-3 lines before/after the change. Break large changes into multiple small replacements.',
+		'Replace exact string content in a file. IMPORTANT: Provide exact content including whitespace and surrounding context. For unique matching, include 2-3 lines before/after the change. Break large changes into multiple small replacements. Successful edits return a bounded context window around the changed range, not the entire file. Missing matches return recovery evidence: verify candidate ranges and retry with actualText copied exactly; if text is omitted, read the indicated range first.',
 	inputSchema: jsonSchema<StringReplaceArgs>({
 		type: 'object',
 		properties: {
@@ -118,6 +211,11 @@ const stringReplaceCoreTool = tool({
 				type: 'string',
 				description:
 					'The replacement string. Can be empty to delete content. Must preserve proper indentation and formatting.',
+			},
+			description: {
+				type: 'string',
+				description:
+					'Optional brief summary of the intent or purpose of this replacement.',
 			},
 		},
 		required: ['path', 'old_str', 'new_str'],
@@ -136,16 +234,21 @@ const stringReplaceFormatter = async (
 ): Promise<React.ReactElement> => {
 	const colors = getColors();
 	const {path, old_str, new_str} = args;
-	const absPath = resolve(path);
+	const absPath = resolve(getSafeSessionCwd(), path);
 
 	if (result === undefined && isVSCodeConnected()) {
 		try {
 			const cached = await getCachedFileContent(absPath);
 			const fileContent = cached.content;
+			const fitted = fitEditToLineEndings(fileContent, old_str, new_str);
 
-			const occurrences = fileContent.split(old_str).length - 1;
+			const occurrences = fileContent.split(fitted.oldStr).length - 1;
 			if (occurrences === 1) {
-				const newContent = fileContent.replace(old_str, new_str);
+				const newContent = replaceFirstLiteral(
+					fileContent,
+					fitted.oldStr,
+					fitted.newStr,
+				);
 
 				const changeId = sendFileChangeToVSCode(
 					absPath,
@@ -180,7 +283,10 @@ const stringReplaceValidator = async (
 	const pathResult = validatePath(path);
 	if (!pathResult.valid) return pathResult;
 
-	const absPath = resolve(path);
+	const formatResult = validateEditableFormat(path);
+	if (!formatResult.valid) return formatResult;
+
+	const absPath = resolve(getSafeSessionCwd(), path);
 	try {
 		await access(absPath, constants.F_OK);
 	} catch (error) {
@@ -207,25 +313,37 @@ const stringReplaceValidator = async (
 		};
 	}
 
+	if (typeof args.new_str !== 'string') {
+		return {valid: false, error: NEW_STR_REQUIRED_ERROR};
+	}
+
 	// Read-before-edit: refuse to edit a file the model has not actually seen
 	// this session. Editing blind is the dominant source of mismatched old_str
 	// on small models; forcing a Read first makes old_str match exactly.
 	if (!hasSeenFile(absPath)) {
 		return {
 			valid: false,
-			error: `You must read "${path}" before editing it. Call read_file on it first, then retry string_replace with old_str copied exactly from the file.`,
+			error: `You must read "${path}" before editing it. Call read_file on it first — if the file is over 300 lines, specify start_line and end_line to read its actual content, not just metadata — then retry string_replace with old_str copied exactly from the file.`,
 		};
 	}
 
 	try {
 		const cached = await getCachedFileContent(absPath);
+		const encodingResult = validateEditableEncoding(path, cached);
+		if (!encodingResult.valid) return encodingResult;
 		const fileContent = cached.content;
-		const occurrences = fileContent.split(old_str).length - 1;
+		const {oldStr} = fitEditToLineEndings(fileContent, old_str, args.new_str);
+		const occurrences = fileContent.split(oldStr).length - 1;
 
 		if (occurrences === 0) {
 			return {
 				valid: false,
-				error: `Content not found in file. The file may have changed since you last read it. Suggestion: Read the file again to see current contents.`,
+				error: new EditRecoveryError(
+					'Content not found in file. The file may have changed since you last read it.',
+					path,
+					fileContent,
+					oldStr,
+				).message,
 			};
 		}
 
@@ -234,6 +352,26 @@ const stringReplaceValidator = async (
 				valid: false,
 				error: `Found ${occurrences} matches for the search string. Please provide more surrounding context to make the match unique.`,
 			};
+		}
+
+		// Line-level visibility check: ensure the agent has actually read the lines
+		// being edited. This prevents blind edits where the model hallucinates
+		// content it never saw.
+		const targetLines = getLineNumbersForText(fileContent, old_str);
+		if (targetLines.length > 0) {
+			try {
+				const stats = await lstat(absPath);
+				const visibilityCheck = hasVisibleLines(absPath, stats, targetLines);
+				if (!visibilityCheck.visible) {
+					return {
+						valid: false,
+						error: visibilityCheck.error ?? 'Lines not visible',
+					};
+				}
+			} catch {
+				// If we can't stat the file, fall back to file-level check (already passed)
+				// This preserves backward compatibility if stat fails for any reason
+			}
 		}
 	} catch (error) {
 		const errorMessage = formatError(error);

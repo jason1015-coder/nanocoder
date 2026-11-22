@@ -3,270 +3,913 @@ import type {
 	PromptResponse,
 	ToolCallStatus,
 } from '@agentclientprotocol/sdk';
+import {ACP_SUBAGENT_NOTIFICATION} from '@/acp/acp-capabilities';
 import {requestToolPermission} from '@/acp/acp-permission';
 import {requestUserChoice} from '@/acp/acp-question';
 import type {AcpSession} from '@/acp/acp-session';
+import {beginTimelineCapture, finishTimelineCapture} from '@/acp/acp-timeline';
 import {type AcpToolCallMeta, buildToolCallMeta} from '@/acp/acp-tool-call';
-import {DEFAULT_HEADLESS_MAX_TURNS, getAppConfig} from '@/config/index';
+import {NO_RESPONSE_MESSAGE, runTurnEngine} from '@/agent-loop/turn-engine';
+import type {
+	ArtifactDescriptor,
+	UserArtifactKind,
+} from '@/artifacts/artifact-manager';
+import {artifactManager} from '@/artifacts/artifact-manager';
+import {
+	createWalkthroughLifecycle,
+	observeSuccessfulLifecycleTool,
+	takeWalkthroughFallback,
+} from '@/artifacts/walkthrough-lifecycle';
+import {
+	DEFAULT_HEADLESS_MAX_TURNS,
+	getAppConfig,
+	getRetryLimits,
+} from '@/config/index';
+import {partitionUnknownToolCalls} from '@/hooks/chat-handler/utils/tool-filters';
 import {processToolUse} from '@/message-handler';
-import {parseToolCalls} from '@/tool-calling/index';
+import {
+	consultPluginPermission,
+	withTrustedProjectPlugins,
+} from '@/plugins/host';
+import {
+	formatVerificationSummary,
+	recordToolOutcome,
+	takeEvidenceRejection,
+} from '@/services/completion-ledger';
+import {runInSessionContext} from '@/services/session-context';
+import {
+	onSubagentRunEvent,
+	type SubagentRunEvent,
+} from '@/services/subagent-events';
 import {resolveToolApproval} from '@/tools/approval-policy';
+import {
+	clearReadContentScope,
+	runWithReadContentScope,
+} from '@/tools/runtime/read-tracker';
+import {
+	registerSubagentToolBridge,
+	type SubagentToolBridge,
+} from '@/tools/runtime/tool-approval-queue';
+import {createCancellationResults} from '@/tools/runtime/tool-cancellation';
 import type {ToolManager} from '@/tools/tool-manager';
 import type {
+	ApiUsage,
 	DevelopmentMode,
 	LLMClient,
 	Message,
-	ModeOverrides,
-	StreamCallbacks,
 	ToolCall,
 	ToolResult,
 } from '@/types/core';
-import {capMessagesForModel} from '@/utils/message-capping';
+import {formatCompactTokenCount} from '@/usage/format';
+import {buildResponseUsage} from '@/usage/response-usage';
 import {toOptionString} from '@/utils/type-helpers';
 
-// On the last allowed turn we strip tools and inject this so the model
-// finalizes cleanly instead of stopping mid-task at the turn ceiling.
-const FINAL_TURN_INSTRUCTION =
-	'You have reached the maximum number of tool-execution turns for this run. ' +
-	'Do not call any more tools. Produce your final answer now using only the ' +
-	'information you already have.';
+const ARTIFACT_TOOL_KINDS: Record<string, UserArtifactKind> = {
+	write_plan: 'implementation_plan',
+	write_tasks: 'task',
+	write_walkthrough: 'walkthrough',
+};
+
+const ARTIFACT_TITLES: Record<UserArtifactKind, string> = {
+	implementation_plan: 'Implementation plan ready',
+	task: 'Tasks updated',
+	walkthrough: 'Walkthrough ready',
+};
 
 export interface RunAcpConversationOptions {
 	session: AcpSession;
 	client: LLMClient;
 	toolManager: ToolManager;
+	/**
+	 * Set when the session has MCP servers of its own. Tool calls, and the
+	 * subagents they start, then run against these tools instead of the
+	 * process-wide set.
+	 */
+	sessionTools?: ToolManager;
 	conn: AgentSideConnection;
 	nonInteractiveAlwaysAllow: string[];
+}
+
+/**
+ * Sub-agent tool calls reach the client through a bridge registered under the
+ * session's id, so two sessions mid-turn can't answer each other's prompts
+ * (the process-wide approval slot only fits the Ink UI). Every call is
+ * announced, approved by the same rules as a top-level call, and settled with
+ * its real outcome.
+ *
+ * Each method catches a client or transport failure: they are awaited outside
+ * the sub-agent executor's own try, so a throw would abort the whole run
+ * instead of costing one card, or denying one tool.
+ */
+function createSubagentToolBridge(
+	session: AcpSession,
+	conn: AgentSideConnection,
+	client: LLMClient,
+): SubagentToolBridge {
+	const metas = new Map<string, AcpToolCallMeta>();
+	// The sub-agent's own model names its tool calls and shares an id space
+	// with the top-level ones, so prefix to keep the two cards distinct.
+	const announced = (toolCall: ToolCall): ToolCall => ({
+		...toolCall,
+		id: `${SUBAGENT_TOOL_CALL_PREFIX}${toolCall.id}`,
+	});
+
+	return {
+		getMode: () => session.developmentMode,
+		// The client this turn started with, as the turn itself keeps it: a model
+		// picked while it runs applies from the next turn, subagents included.
+		getClient: () => client,
+		getDisabledTools: () => session.effectiveDisabledTools(),
+		begin: async (toolCall, subagentName) => {
+			const call = announced(toolCall);
+			try {
+				const meta = await buildToolCallMeta(call);
+				const subagentMeta: AcpToolCallMeta = {
+					...meta,
+					title: `${meta.title} (${subagentName})`,
+				};
+				metas.set(call.id, subagentMeta);
+				// Announced first: a permission request naming a tool call the
+				// client has not seen is rejected as invalid params.
+				await emitToolCall(session, conn, call, 'pending', subagentMeta);
+			} catch {
+				// The call still runs; the client just never saw its card.
+			}
+		},
+		approve: async (toolCall, abortSignal, subagentRunId) => {
+			const call = announced(toolCall);
+			try {
+				return await requestToolPermission(
+					session,
+					call,
+					conn,
+					metas.get(call.id),
+					abortSignal,
+					subagentRunId ? {'nanocoder/childRunId': subagentRunId} : undefined,
+				);
+			} catch {
+				return 'denied';
+			}
+		},
+		end: async (toolCall, {content, failed}) => {
+			const call = announced(toolCall);
+			metas.delete(call.id);
+			try {
+				await emitToolCallUpdate(
+					session,
+					conn,
+					call,
+					failed ? 'failed' : 'completed',
+					content,
+				);
+			} catch {
+				// Nothing left to settle if the client is gone.
+			}
+		},
+	};
 }
 
 export async function runAcpConversation(
 	options: RunAcpConversationOptions,
 ): Promise<PromptResponse> {
+	// Scoped to the turn: a bridge outliving it would keep a finished turn's
+	// session and connection reachable.
+	const unregisterBridge = registerSubagentToolBridge(
+		options.session.sessionId,
+		createSubagentToolBridge(options.session, options.conn, options.client),
+	);
+	// Tell the client about each subagent run of this session as it happens.
+	// Sent in order, and never allowed to fail the turn: a client that ignores
+	// the notification sees exactly what it saw before it existed.
+	let sentSubagentEvents: Promise<void> = Promise.resolve();
+	const stopSubagentEvents = onSubagentRunEvent(event => {
+		if (event.sessionId !== options.session.sessionId) return;
+		sentSubagentEvents = sentSubagentEvents
+			.then(() => options.conn.notify(ACP_SUBAGENT_NOTIFICATION, {...event}))
+			.catch(() => {});
+		// Clients that ignore the notification still see the run's progress, in
+		// the title of the agent call that started it. Sent as the event
+		// arrives rather than queued behind the notifications, so it can never
+		// land after the call's own completed update.
+		if (event.status === 'progress' && !event.parentRunId && event.toolCallId) {
+			void options.conn
+				.sessionUpdate({
+					sessionId: options.session.sessionId,
+					update: {
+						sessionUpdate: 'tool_call_update',
+						toolCallId: event.toolCallId,
+						status: 'in_progress',
+						title: subagentProgressTitle(event),
+					},
+				})
+				.catch(() => {});
+		}
+	});
+	try {
+		// Each ACP session runs in its own working directory (#1707), and one
+		// editor process can host several chats. A read_file stub only makes
+		// sense in the chat whose history holds the earlier read.
+		return await runInSessionContext(options.session.context, () =>
+			runWithReadContentScope(acpReadScope(options.session.sessionId), () =>
+				withTrustedProjectPlugins(options.session.cwd, () => runTurn(options)),
+			),
+		);
+	} finally {
+		stopSubagentEvents();
+		await sentSubagentEvents;
+		unregisterBridge();
+	}
+}
+
+function subagentProgressTitle(event: SubagentRunEvent): string {
+	const tokens = formatCompactTokenCount(event.tokenCount ?? 0);
+	const toolCalls = event.toolCallCount ?? 0;
+	return toolCalls > 0
+		? `${event.name || 'agent'} • ${tokens} tokens • ${toolCalls} tools${event.lastTool ? ` (${event.lastTool})` : ''}`
+		: `${event.name || 'agent'} • ${tokens} tokens • thinking...`;
+}
+
+function acpReadScope(sessionId: string): string {
+	return `acp:${sessionId}`;
+}
+
+/** Forget read stubs for a chat whose history was cut, swapped, or deleted. */
+export function clearAcpReadStubs(sessionId: string): void {
+	clearReadContentScope(acpReadScope(sessionId));
+}
+
+const SUBAGENT_TOOL_CALL_PREFIX = 'subagent:';
+
+/**
+ * Give every tool call of the latest assistant message a result, for a turn
+ * that threw part way through its batch. History keeps the round-trips that
+ * ran, and a stored tool call with no result would have the provider reject
+ * every later prompt of the session.
+ */
+export function settleUnansweredToolCalls(messages: Message[]): Message[] {
+	let index = messages.length - 1;
+	while (index >= 0 && messages[index].role === 'tool') index--;
+	const calls = index >= 0 ? (messages[index].tool_calls ?? []) : [];
+	const answered = new Set(
+		messages.slice(index + 1).map(message => message.tool_call_id),
+	);
+	const unanswered = calls.filter(call => !answered.has(call.id));
+	if (unanswered.length === 0) return messages;
+	return [
+		...messages,
+		...unanswered.map(call => ({
+			role: 'tool' as const,
+			tool_call_id: call.id,
+			name: call.function.name,
+			content:
+				'Error: the turn ended before the result of this tool call was recorded.',
+		})),
+	];
+}
+
+async function runTurn(
+	options: RunAcpConversationOptions,
+): Promise<PromptResponse> {
 	const {session, client, toolManager, conn, nonInteractiveAlwaysAllow} =
 		options;
-	const {developmentMode, abortController} = session;
+	const {abortController} = session;
 
-	let messages = session.messages;
+	// One id per prompt, shared by every checkpoint it records. The model
+	// round-trips inside a prompt each move `truncateToMessageIndex` forward, so
+	// a client cannot use that to tell which tool calls belong to one turn.
+	const turnId = crypto.randomUUID();
+
+	// The turn writes straight to the session's history rather than a copy it
+	// stores on the way out, so a throw part way through a prompt keeps the
+	// round-trips that already ran. Those may have edited files, and the
+	// timeline's checkpoints point at message indices inside them.
+	const walkthroughLifecycle = createWalkthroughLifecycle(session.messages);
+	let wrotePlan = false;
+
+	// Provider-reported usage accumulated across this prompt's model calls,
+	// returned on the PromptResponse (experimental ACP `usage` field) so
+	// clients like the VS Code extension can show a per-response indicator.
+	// Fields stay undefined until a finite value arrives: zero-filling
+	// unreported input/output would route a total-only report into the
+	// input/output cost branch of buildResponseUsage and price it at $0.
+	const turnUsage: ApiUsage = {};
+
+	const recordUsage = (usage: ApiUsage | undefined) => {
+		if (!usage) return;
+		if (Number.isFinite(usage.inputTokens)) {
+			turnUsage.inputTokens =
+				(turnUsage.inputTokens ?? 0) + (usage.inputTokens as number);
+		}
+		if (Number.isFinite(usage.outputTokens)) {
+			turnUsage.outputTokens =
+				(turnUsage.outputTokens ?? 0) + (usage.outputTokens as number);
+		}
+		if (Number.isFinite(usage.cacheReadTokens)) {
+			turnUsage.cacheReadTokens =
+				(turnUsage.cacheReadTokens ?? 0) + (usage.cacheReadTokens as number);
+		}
+		if (Number.isFinite(usage.cacheWriteTokens)) {
+			turnUsage.cacheWriteTokens =
+				(turnUsage.cacheWriteTokens ?? 0) + (usage.cacheWriteTokens as number);
+		}
+		// Keep the running total consistent when a call reports only
+		// input/output: add their sum so mixed-report turns don't understate.
+		const total = Number.isFinite(usage.totalTokens)
+			? (usage.totalTokens as number)
+			: Number.isFinite(usage.inputTokens) ||
+					Number.isFinite(usage.outputTokens)
+				? ((usage.inputTokens as number) || 0) +
+					((usage.outputTokens as number) || 0)
+				: undefined;
+		if (total !== undefined) {
+			turnUsage.totalTokens = (turnUsage.totalTokens ?? 0) + total;
+		}
+	};
+
+	// Attach accumulated usage (and best-effort estimated cost via _meta) to
+	// a turn-ending response. A no-op when no model call reported usage.
+	const withTurnUsage = async (
+		response: PromptResponse,
+	): Promise<PromptResponse> => {
+		const usageReported =
+			turnUsage.inputTokens !== undefined ||
+			turnUsage.outputTokens !== undefined ||
+			turnUsage.totalTokens !== undefined ||
+			turnUsage.cacheReadTokens !== undefined ||
+			turnUsage.cacheWriteTokens !== undefined;
+		if (!usageReported) return response;
+		// Cost is computed from the sparse accumulators so a total-only turn
+		// takes the lump-sum averaging branch instead of pricing 0+0 tokens.
+		const priced = await buildResponseUsage(
+			turnUsage,
+			client.getCurrentModel(),
+		);
+		const input = turnUsage.inputTokens ?? 0;
+		const output = turnUsage.outputTokens ?? 0;
+		return {
+			...response,
+			// The ACP Usage type requires all three fields, so unreported ones
+			// are zero-filled here — on the wire only, after cost is computed.
+			usage: {
+				inputTokens: input,
+				outputTokens: output,
+				totalTokens: turnUsage.totalTokens ?? input + output,
+			},
+			...(priced?.cost != null
+				? {_meta: {'nanocoder/usage': {cost: priced.cost}}}
+				: {}),
+		};
+	};
 
 	const maxTurns =
 		getAppConfig().headless?.maxTurns ?? DEFAULT_HEADLESS_MAX_TURNS;
 
-	for (let turn = 0; turn < maxTurns; turn++) {
-		if (abortController.signal.aborted) {
-			return {stopReason: 'cancelled'};
-		}
-
-		// On the final turn, force a tool-free wrap-up so we end with an answer
-		// rather than stopping mid-task at the ceiling.
-		const finalTurn = turn === maxTurns - 1;
-
-		const availableNames = toolManager.getAvailableToolNames(
-			undefined,
-			developmentMode,
-		);
-		const tools = finalTurn ? {} : toolManager.getFilteredTools(availableNames);
-
-		const modeOverrides: ModeOverrides = {
-			nonInteractiveMode: true,
-			nonInteractiveAlwaysAllow,
-		};
-
-		let streamedReasoning = '';
-
-		const callbacks: StreamCallbacks = {
-			onReasoningToken: (token: string) => {
-				streamedReasoning += token;
-				conn.sessionUpdate({
-					sessionId: session.sessionId,
-					update: {
-						sessionUpdate: 'agent_thought_chunk',
-						content: {type: 'text', text: token},
-					},
-				});
+	// Ends the turn early with the reason shown in the chat. Kept in history as
+	// harness chrome, so a reloaded session shows it but the model never does.
+	const stopWithNotice = async (
+		notice: string,
+		stopReason: PromptResponse['stopReason'],
+	): Promise<PromptResponse> => {
+		const text = `\n\n_${notice}_\n`;
+		await conn.sessionUpdate({
+			sessionId: session.sessionId,
+			update: {
+				sessionUpdate: 'agent_message_chunk',
+				content: {type: 'text', text},
 			},
-			onToken: (token: string) => {
+		});
+		session.messages = [
+			...session.messages,
+			{role: 'assistant', content: text, displayOnly: true},
+		];
+		return withTurnUsage({stopReason});
+	};
+
+	// The client's per-session disabled list as this turn's request saw it.
+	// session/set_mode can arrive at any point in a turn, so the mode is read
+	// live: when the turn starts for the tools offered, and again per call for
+	// approval.
+	let disabledTools: string[] = [];
+
+	const result = await runTurnEngine<'cancelled'>({
+		client,
+		signal: abortController.signal,
+		maxTurns,
+		// The `nanocoder.retries` caps the plain shell applies. Nobody is there
+		// to ask whether to carry on, so a model stuck repeating a call,
+		// answering with nothing or emitting broken tool calls is stopped well
+		// short of maxTurns instead of spending a request on every one of them.
+		retryLimits: getRetryLimits(),
+		adapter: {
+			// The turn writes straight to the session's history, so a throw part
+			// way through keeps the round-trips that already ran.
+			history: {
+				get: () => session.messages,
+				set: messages => {
+					session.messages = messages;
+				},
+			},
+			getSystemMessage: () => session.systemMessage,
+			prepareTurn: () => {
+				// The client's per-session list on top of the user's own
+				// disabledTools.
+				disabledTools = session.effectiveDisabledTools();
+				const availableNames = toolManager.getAvailableToolNames(
+					undefined,
+					session.developmentMode,
+					disabledTools,
+				);
+				return {
+					tools: toolManager.getFilteredTools(availableNames),
+					availableNames,
+					modeOverrides: {
+						nonInteractiveMode: true,
+						nonInteractiveAlwaysAllow,
+						nativeToolsDisabled: session.nativeToolsDisabled,
+					},
+				};
+			},
+			beginModelCall: () => {
+				let streamedReasoning = '';
+				return {
+					callbacks: {
+						onReasoningToken: (token: string) => {
+							// Leading whitespace renders to nothing but still opens a
+							// thought section, leaving a bare "Thought for 0s" bubble, so
+							// drop it. Only what's emitted is accumulated:
+							// replaySessionHistory re-sends the stored reasoning verbatim,
+							// so anything skipped here has to stay out of the message or a
+							// reloaded session renders differently from the live one.
+							const text = streamedReasoning ? token : token.trimStart();
+							if (!text) {
+								return;
+							}
+							streamedReasoning += text;
+							conn.sessionUpdate({
+								sessionId: session.sessionId,
+								update: {
+									sessionUpdate: 'agent_thought_chunk',
+									content: {type: 'text', text},
+								},
+							});
+						},
+						onToken: (token: string) => {
+							conn.sessionUpdate({
+								sessionId: session.sessionId,
+								update: {
+									sessionUpdate: 'agent_message_chunk',
+									content: {type: 'text', text: token},
+								},
+							});
+						},
+					},
+					reasoning: () =>
+						streamedReasoning.trim() ? streamedReasoning : undefined,
+				};
+			},
+			onModelResponse: response => recordUsage(response?.usage),
+			partitionToolCalls: toolCalls =>
+				partitionUnknownToolCalls(toolCalls, toolManager),
+			compactOptions: () => ({aggressiveCompact: session.aggressiveCompact}),
+			onFinalAnswer: async ({content, finalTurn, turn, prepared}) => {
+				if (
+					session.developmentMode === 'plan' &&
+					!wrotePlan &&
+					toolManager
+						.getAvailableToolNames(
+							undefined,
+							session.developmentMode,
+							disabledTools,
+						)
+						.includes('write_plan') &&
+					content.trim().length > 0
+				) {
+					const fallbackCall: ToolCall = {
+						id: `write-plan-fallback-${session.sessionId}-${turn}`,
+						function: {
+							name: 'write_plan',
+							arguments: {content},
+						},
+					};
+					const fallbackResult = await executePlanFallback(
+						session,
+						conn,
+						fallbackCall,
+					);
+					session.messages = [
+						...session.messages.slice(0, -1),
+						{
+							...session.messages[session.messages.length - 1],
+							tool_calls: [fallbackCall],
+						},
+						fallbackResult,
+					];
+					wrotePlan = !fallbackResult.isError;
+				}
+
+				const fallback = finalTurn
+					? null
+					: takeWalkthroughFallback(
+							walkthroughLifecycle,
+							prepared.availableNames.includes('write_walkthrough'),
+						);
+				if (fallback) {
+					return {kind: 'continue', messages: [fallback]};
+				}
+
+				// With `nanocoder.verify.required` set, a turn that edited files
+				// cannot end until the required commands have exited 0 since the
+				// last edit.
+				const evidenceRejection = finalTurn
+					? null
+					: takeEvidenceRejection(walkthroughLifecycle.ledger);
+				return evidenceRejection
+					? {kind: 'continue', messages: [evidenceRejection]}
+					: {kind: 'finish'};
+			},
+			executeTools: async validToolCalls => {
+				const announcedBatch =
+					validToolCalls.length > 1 && !abortController.signal.aborted;
+				if (announcedBatch) {
+					for (const toolCall of validToolCalls) {
+						// withDiff: false - the announcement drops content below, so
+						// there is no reason to read the file to build a diff first.
+						const queuedMeta = await buildToolCallMeta(toolCall, {
+							withDiff: false,
+						});
+						// Content is withheld until the call is about to run: the client
+						// enables its "open diff" affordance off this field, and a diff
+						// registered now would be stale by the time the tool executes.
+						await emitToolCall(session, conn, toolCall, 'pending', {
+							...queuedMeta,
+							content: [],
+						});
+					}
+				}
+
+				// Process tool calls
+				const toolResults: ToolResult[] = [];
+				for (let index = 0; index < validToolCalls.length; index++) {
+					const toolCall = validToolCalls[index];
+					// Stop was pressed: don't start any remaining queued tools. Record a
+					// cancelled result for each so the assistant's tool_calls keep matched
+					// results in history; the turn ends below instead of re-prompting.
+					if (abortController.signal.aborted) {
+						if (announcedBatch) {
+							await emitToolCallUpdate(
+								session,
+								conn,
+								toolCall,
+								'failed',
+								'Cancelled by user',
+							);
+						}
+						toolResults.push({
+							tool_call_id: toolCall.id,
+							role: 'tool',
+							name: toolCall.function.name,
+							content: 'Error: cancelled by user',
+						});
+						continue;
+					}
+
+					// A registered tool the session's current mode does not offer is refused
+					// even if the model names it anyway: the offered list only narrows what
+					// the model sees, and alwaysAllow would otherwise run a hidden tool
+					// unprompted (a mutating tool in plan mode). This also covers a mode
+					// switch after the request (e.g. to plan). Unknown names fall through
+					// to the unknown-tool handling.
+					const toolName = toolCall.function.name;
+					// A tool the session does not offer is refused even if the model names it
+					// anyway. The list is read live, as the mode is: session/load can replace
+					// it at any point in a turn, and a tool the client just turned off must
+					// not run on the strength of the list this request was made with.
+					const disabled = session.effectiveDisabledTools().includes(toolName);
+					if (
+						disabled ||
+						(toolManager.hasTool(toolName) &&
+							!toolManager
+								.getAvailableToolNames(
+									undefined,
+									session.developmentMode,
+									disabledTools,
+								)
+								.includes(toolName))
+					) {
+						const reason = disabled
+							? `Error: ${toolName} is disabled in this session`
+							: `Error: ${toolName} is not available in ${session.developmentMode} mode`;
+						// A lone call has not been announced yet; give the failed update a
+						// card to land on.
+						if (!announcedBatch) {
+							await emitToolCall(
+								session,
+								conn,
+								toolCall,
+								'pending',
+								await buildToolCallMeta(toolCall, {withDiff: false}),
+							);
+						}
+						await emitToolCallUpdate(session, conn, toolCall, 'failed', reason);
+						toolResults.push({
+							tool_call_id: toolCall.id,
+							role: 'tool',
+							name: toolName,
+							content: reason,
+						});
+						continue;
+					}
+
+					// Enrich the call with ACP metadata (kind, file locations, and a diff
+					// for edits) so the client can render rich tool cards and previews.
+					const meta = await buildToolCallMeta(toolCall);
+
+					// Notify client about tool call. Already-announced calls get an
+					// update rather than a second tool_call: clients that append on
+					// tool_call (instead of upserting by id) would double-render it.
+					await emitToolCall(
+						session,
+						conn,
+						toolCall,
+						'pending',
+						meta,
+						announcedBatch ? 'tool_call_update' : 'tool_call',
+					);
+
+					// ask_user is interactive: instead of executing it, surface the
+					// question's options through the client and feed the choice back as
+					// the tool result. We reuse this call's id (just announced) so the
+					// permission request targets a known tool call.
+					if (toolCall.function.name === 'ask_user') {
+						const answer = await handleAskUser(
+							session,
+							conn,
+							toolCall,
+							abortController.signal,
+						);
+						toolResults.push(answer);
+						continue;
+					}
+
+					// Check if approval is needed. resolveToolApproval is the single
+					// authority shared with the interactive loop and plain shell - it
+					// applies yolo and the alwaysAllow list internally.
+					const needsApproval = await evaluateNeedsApproval(
+						toolCall,
+						toolManager,
+						nonInteractiveAlwaysAllow,
+						session.developmentMode,
+					);
+
+					if (needsApproval) {
+						const vote = await consultPluginPermission(
+							toolCall.function.name,
+							toolCall.function.arguments,
+						);
+						if (vote.decision === 'deny') {
+							await emitToolCallUpdate(
+								session,
+								conn,
+								toolCall,
+								'failed',
+								vote.reason,
+							);
+							toolResults.push({
+								tool_call_id: toolCall.id,
+								role: 'tool',
+								name: toolCall.function.name,
+								content: `Tool call denied: ${vote.reason}`,
+							});
+							continue;
+						}
+
+						const permission = await requestToolPermission(
+							session,
+							toolCall,
+							conn,
+							meta,
+							abortController.signal,
+						);
+
+						if (permission === 'cancelled') {
+							await emitToolCallUpdate(
+								session,
+								conn,
+								toolCall,
+								'failed',
+								'Cancelled by user',
+							);
+							if (announcedBatch) {
+								for (const queued of validToolCalls.slice(index + 1)) {
+									await emitToolCallUpdate(
+										session,
+										conn,
+										queued,
+										'failed',
+										'Cancelled by user',
+									);
+								}
+							}
+							toolResults.push(
+								...createCancellationResults(validToolCalls.slice(index)),
+							);
+							return {kind: 'stop', payload: 'cancelled', results: toolResults};
+						}
+
+						if (permission === 'denied') {
+							await emitToolCallUpdate(
+								session,
+								conn,
+								toolCall,
+								'failed',
+								'Denied by user',
+							);
+							toolResults.push({
+								tool_call_id: toolCall.id,
+								role: 'tool',
+								name: toolCall.function.name,
+								content: 'Tool call denied by user',
+							});
+							continue;
+						}
+					}
+
+					// Execute tool
+					await emitToolCallUpdate(session, conn, toolCall, 'in_progress');
+
+					const timelineCapture = await beginTimelineCapture(
+						session,
+						toolManager,
+						toolCall,
+						session.messages,
+						meta.title,
+						turnId,
+					);
+
+					const toolResult = await processToolUse(toolCall, {
+						abortSignal: abortController.signal,
+						sessionId: session.sessionId,
+						workingDirectory: session.cwd,
+						...(options.sessionTools && {toolManager: options.sessionTools}),
+						toolCallId: toolCall.id,
+						client,
+					});
+					await finishTimelineCapture(session, timelineCapture);
+
+					// isError covers failures whose text doesn't start with "Error": a
+					// validation failure, or a command that exited non-zero.
+					const status: ToolCallStatus =
+						toolResult.isError || toolResult.content.startsWith('Error')
+							? 'failed'
+							: 'completed';
+					await emitToolCallUpdate(
+						session,
+						conn,
+						toolCall,
+						status,
+						toolResult.content,
+					);
+					toolResults.push(toolResult);
+					recordToolOutcome(walkthroughLifecycle.ledger, toolCall, toolResult);
+					if (status === 'completed') {
+						observeSuccessfulLifecycleTool(walkthroughLifecycle, toolCall);
+						if (toolCall.function.name === 'write_plan') {
+							wrotePlan = true;
+						}
+					}
+
+					// write_tasks replaces the whole task list; mirror it to the client
+					// as an ACP plan update so GUIs can render a live checklist.
+					if (
+						toolCall.function.name === 'write_tasks' &&
+						status === 'completed'
+					) {
+						await emitPlanUpdate(session, conn, toolCall);
+					}
+				}
+
+				return {kind: 'continue', results: toolResults};
+			},
+		},
+	});
+
+	switch (result.kind) {
+		case 'completed': {
+			const verification = formatVerificationSummary(
+				walkthroughLifecycle.ledger,
+			);
+			if (verification) {
 				conn.sessionUpdate({
 					sessionId: session.sessionId,
 					update: {
 						sessionUpdate: 'agent_message_chunk',
-						content: {type: 'text', text: token},
+						content: {type: 'text', text: `\n\n${verification}`},
 					},
 				});
-			},
-		};
-
-		const systemMessage = session.systemMessage;
-		if (!systemMessage) {
-			return {stopReason: 'end_turn'};
-		}
-
-		const sessionConfig = getAppConfig().sessions;
-		const maxMessages = sessionConfig?.maxMessages ?? 1000;
-		const cappedMessages = capMessagesForModel(messages, maxMessages);
-
-		const finalTurnNotice: Message[] = finalTurn
-			? [{role: 'user', content: FINAL_TURN_INSTRUCTION}]
-			: [];
-
-		const result = await client.chat(
-			[systemMessage, ...cappedMessages, ...finalTurnNotice],
-			tools,
-			callbacks,
-			abortController.signal,
-			modeOverrides,
-		);
-
-		if (!result || !result.choices || result.choices.length === 0) {
-			return {stopReason: 'end_turn'};
-		}
-
-		const message = result.choices[0].message;
-		const nativeToolCalls = message.tool_calls || [];
-		const fullContent = message.content || '';
-
-		const xmlParse =
-			result.toolsDisabled && !finalTurn
-				? parseToolCalls(fullContent)
-				: {success: true as const, toolCalls: [], cleanedContent: fullContent};
-
-		if (!xmlParse.success) {
-			return {stopReason: 'end_turn'};
-		}
-
-		const allToolCalls: ToolCall[] = [
-			...nativeToolCalls,
-			...xmlParse.toolCalls,
-		];
-		const cleanedContent = xmlParse.cleanedContent;
-
-		const validToolCalls: ToolCall[] = [];
-		const errorResults: ToolResult[] = [];
-		for (const toolCall of allToolCalls) {
-			if (
-				toolCall.function.name === '__xml_validation_error__' ||
-				!toolManager.hasTool(toolCall.function.name)
-			) {
-				errorResults.push({
-					tool_call_id: toolCall.id,
-					role: 'tool',
-					name: toolCall.function.name,
-					content: `Unknown tool: ${toolCall.function.name}`,
-				});
-				continue;
 			}
-			validToolCalls.push(toolCall);
+			return withTurnUsage({stopReason: 'end_turn'});
 		}
-
-		messages = [
-			...messages,
-			{
-				role: 'assistant',
-				content: cleanedContent,
-				tool_calls: validToolCalls.length > 0 ? validToolCalls : undefined,
-				reasoning: streamedReasoning || undefined,
-			},
-		];
-
-		if (errorResults.length > 0) {
-			messages = [...messages, ...errorResults];
-			continue;
-		}
-
-		if (validToolCalls.length === 0) {
-			session.messages = messages;
-			return {stopReason: 'end_turn'};
-		}
-
-		// Process tool calls
-		const toolResults: ToolResult[] = [];
-		for (const toolCall of validToolCalls) {
-			// Enrich the call with ACP metadata (kind, file locations, and a diff
-			// for edits) so the client can render rich tool cards and previews.
-			const meta = await buildToolCallMeta(toolCall);
-
-			// Notify client about tool call
-			await emitToolCall(session, conn, toolCall, 'pending', meta);
-
-			// ask_user is interactive: instead of executing it, surface the
-			// question's options through the client and feed the choice back as
-			// the tool result. We reuse this call's id (just announced) so the
-			// permission request targets a known tool call.
-			if (toolCall.function.name === 'ask_user') {
-				const answer = await handleAskUser(session, conn, toolCall);
-				toolResults.push(answer);
-				continue;
-			}
-
-			// Check if approval is needed. resolveToolApproval is the single
-			// authority shared with the interactive loop and plain shell - it
-			// applies yolo and the alwaysAllow list internally.
-			const needsApproval = await evaluateNeedsApproval(
-				toolCall,
-				toolManager,
-				nonInteractiveAlwaysAllow,
-				developmentMode,
-			);
-
-			if (needsApproval) {
-				const permission = await requestToolPermission(
-					session,
-					toolCall,
-					conn,
-					meta,
-				);
-
-				if (permission === 'cancelled') {
-					await emitToolCallUpdate(
-						session,
-						conn,
-						toolCall,
-						'failed',
-						'Cancelled by user',
-					);
-					session.messages = [...messages, ...toolResults];
-					return {stopReason: 'cancelled'};
-				}
-
-				if (permission === 'denied') {
-					await emitToolCallUpdate(
-						session,
-						conn,
-						toolCall,
-						'failed',
-						'Denied by user',
-					);
-					toolResults.push({
+		case 'no-system-message':
+			return withTurnUsage({stopReason: 'end_turn'});
+		// A provider that answers with no choices failed the request, as a
+		// thrown model call does, so it is reported the same way.
+		case 'no-response':
+			throw new Error(NO_RESPONSE_MESSAGE);
+		case 'aborted':
+		case 'adapter-stop':
+			return withTurnUsage({stopReason: 'cancelled'});
+		case 'model-error':
+			throw result.error;
+		case 'guard-stop':
+			// Every stored tool call needs a result, or the provider rejects the
+			// session's next prompt.
+			if (result.unrunToolCalls.length > 0) {
+				session.messages = [
+					...session.messages,
+					...result.unrunToolCalls.map(toolCall => ({
 						tool_call_id: toolCall.id,
-						role: 'tool',
+						role: 'tool' as const,
 						name: toolCall.function.name,
-						content: 'Tool call denied by user',
-					});
-					continue;
-				}
+						content: `Error: not run. ${result.message}`,
+					})),
+				];
 			}
-
-			// Execute tool
-			await emitToolCallUpdate(session, conn, toolCall, 'in_progress');
-			const toolResult = await processToolUse(toolCall);
-
-			const status: ToolCallStatus = toolResult.content.startsWith('Error')
-				? 'failed'
-				: 'completed';
-			await emitToolCallUpdate(
-				session,
-				conn,
-				toolCall,
-				status,
-				toolResult.content,
+			return stopWithNotice(
+				result.message,
+				result.guard === 'repeated-tool-calls'
+					? 'max_turn_requests'
+					: 'end_turn',
 			);
-			toolResults.push(toolResult);
-		}
-
-		messages = [...messages, ...toolResults];
+		case 'max-turns':
+			return withTurnUsage({stopReason: 'max_turn_requests'});
 	}
+}
 
-	session.messages = messages;
-	return {stopReason: 'max_turn_requests'};
+async function executePlanFallback(
+	session: AcpSession,
+	conn: AgentSideConnection,
+	toolCall: ToolCall,
+): Promise<ToolResult> {
+	const meta = await buildToolCallMeta(toolCall);
+	await emitToolCall(session, conn, toolCall, 'pending', meta);
+	await emitToolCallUpdate(session, conn, toolCall, 'in_progress');
+	const result = await processToolUse(toolCall, {
+		abortSignal: session.abortController.signal,
+		sessionId: session.sessionId,
+		workingDirectory: session.cwd,
+	});
+	await emitToolCallUpdate(
+		session,
+		conn,
+		toolCall,
+		result.isError ? 'failed' : 'completed',
+		result.content,
+	);
+	return result;
+}
+
+/**
+ * Mirror a successful `write_tasks` call to the client as an ACP `plan`
+ * session update. The tool's args carry the complete replacement task list
+ * (TodoWrite-style), which maps 1:1 onto ACP plan entries; tasks have no
+ * priority concept, so entries are reported as `medium`.
+ */
+async function emitPlanUpdate(
+	session: AcpSession,
+	conn: AgentSideConnection,
+	toolCall: ToolCall,
+): Promise<void> {
+	const args = toolCall.function.arguments as {
+		tasks?: Array<{title?: unknown; status?: unknown}>;
+	};
+	const tasks = Array.isArray(args?.tasks) ? args.tasks : [];
+	const validStatuses = ['pending', 'in_progress', 'completed'] as const;
+	const taskArtifactPath = artifactManager.tryGetArtifactPath(
+		session.sessionId,
+		'task',
+	);
+	const taskArtifact: ArtifactDescriptor | undefined = taskArtifactPath
+		? {kind: 'task', path: taskArtifactPath}
+		: undefined;
+
+	await conn.sessionUpdate({
+		sessionId: session.sessionId,
+		update: {
+			sessionUpdate: 'plan',
+			_meta: taskArtifact ? {'nanocoder/artifact': taskArtifact} : undefined,
+			entries: tasks
+				.filter(t => typeof t?.title === 'string')
+				.map(t => ({
+					content: t.title as string,
+					priority: 'medium' as const,
+					status: validStatuses.includes(
+						t.status as (typeof validStatuses)[number],
+					)
+						? (t.status as (typeof validStatuses)[number])
+						: 'pending',
+				})),
+		},
+	});
 }
 
 async function emitToolCall(
@@ -275,19 +918,25 @@ async function emitToolCall(
 	toolCall: ToolCall,
 	status: ToolCallStatus,
 	meta: AcpToolCallMeta,
+	sessionUpdate: 'tool_call' | 'tool_call_update' = 'tool_call',
 ): Promise<void> {
+	// Spelled out per branch: the union of both literals does not narrow
+	// SessionUpdate's discriminant.
+	const payload = {
+		toolCallId: toolCall.id,
+		title: meta.title,
+		kind: meta.kind,
+		rawInput: toolCall.function.arguments,
+		status,
+		content: meta.content.length > 0 ? meta.content : undefined,
+		locations: meta.locations.length > 0 ? meta.locations : undefined,
+	};
 	await conn.sessionUpdate({
 		sessionId: session.sessionId,
-		update: {
-			sessionUpdate: 'tool_call',
-			toolCallId: toolCall.id,
-			title: meta.title,
-			kind: meta.kind,
-			rawInput: toolCall.function.arguments,
-			status,
-			content: meta.content.length > 0 ? meta.content : undefined,
-			locations: meta.locations.length > 0 ? meta.locations : undefined,
-		},
+		update:
+			sessionUpdate === 'tool_call'
+				? {...payload, sessionUpdate: 'tool_call'}
+				: {...payload, sessionUpdate: 'tool_call_update'},
 	});
 }
 
@@ -297,7 +946,28 @@ async function emitToolCallUpdate(
 	toolCall: ToolCall,
 	status: ToolCallStatus,
 	rawOutput?: unknown,
+	title?: string,
 ): Promise<void> {
+	const artifactKind = ARTIFACT_TOOL_KINDS[toolCall.function.name];
+	const artifactPath = artifactKind
+		? artifactManager.tryGetArtifactPath(session.sessionId, artifactKind)
+		: undefined;
+	const artifact: ArtifactDescriptor | undefined =
+		status === 'completed' && artifactKind && artifactPath
+			? {
+					kind: artifactKind,
+					path: artifactPath,
+				}
+			: undefined;
+	const meta = artifact
+		? {
+				'nanocoder/artifact': artifact,
+				...(artifact.kind === 'implementation_plan'
+					? {'nanocoder/planArtifact': {path: artifact.path}}
+					: {}),
+			}
+		: undefined;
+
 	await conn.sessionUpdate({
 		sessionId: session.sessionId,
 		update: {
@@ -305,6 +975,9 @@ async function emitToolCallUpdate(
 			toolCallId: toolCall.id,
 			status,
 			rawOutput,
+			title: artifact ? ARTIFACT_TITLES[artifact.kind] : title,
+			locations: artifact ? [{path: artifact.path}] : undefined,
+			_meta: meta,
 		},
 	});
 }
@@ -313,14 +986,15 @@ async function handleAskUser(
 	session: AcpSession,
 	conn: AgentSideConnection,
 	toolCall: ToolCall,
+	abortSignal?: AbortSignal,
 ): Promise<ToolResult> {
 	const args = toolCall.function.arguments ?? {};
 	const question = typeof args.question === 'string' ? args.question : '';
 	const options = normalizeQuestionOptions(args.options);
 
 	let content: string;
-	if (!question || options.length < 2 || options.length > 4) {
-		content = 'Error: ask_user requires a question and 2-4 string options.';
+	if (!question || options.length < 2 || options.length > 6) {
+		content = 'Error: ask_user requires a question and 2-6 string options.';
 		await emitToolCallUpdate(session, conn, toolCall, 'failed', content);
 	} else {
 		await emitToolCallUpdate(session, conn, toolCall, 'in_progress');
@@ -330,6 +1004,7 @@ async function handleAskUser(
 			toolCall.id,
 			question,
 			options,
+			abortSignal,
 		);
 		const status: ToolCallStatus = content.startsWith('Error')
 			? 'failed'

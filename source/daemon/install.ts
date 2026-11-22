@@ -25,8 +25,14 @@ import {createHash} from 'node:crypto';
 import {existsSync, mkdirSync} from 'node:fs';
 import {readFile, unlink, writeFile} from 'node:fs/promises';
 import {homedir} from 'node:os';
-import {dirname, join} from 'node:path';
+import {dirname, join, resolve} from 'node:path';
 import {promisify} from 'node:util';
+import {loadPreferences} from '@/config/preferences';
+import {
+	isDirectoryTrusted,
+	trustRecheck,
+	untrustedReason,
+} from '@/config/trust/directory-trust';
 import {formatError} from '@/utils/error-formatter';
 
 const execFileAsync = promisify(execFile);
@@ -114,6 +120,7 @@ export function buildLaunchAgentPlist(
 	hash: string,
 	daemonCommand: string,
 ): string {
+	const root = xmlEscape(projectRoot);
 	return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -122,16 +129,16 @@ export function buildLaunchAgentPlist(
 \t<string>com.nanocoder.daemon.${hash}</string>
 \t<key>ProgramArguments</key>
 \t<array>
-\t\t<string>${daemonCommand}</string>
+\t\t<string>${xmlEscape(daemonCommand)}</string>
 \t\t<string>daemon</string>
 \t\t<string>start</string>
 \t</array>
 \t<key>WorkingDirectory</key>
-\t<string>${projectRoot}</string>
+\t<string>${root}</string>
 \t<key>EnvironmentVariables</key>
 \t<dict>
 \t\t<key>NANOCODER_PROJECT_ROOT</key>
-\t\t<string>${projectRoot}</string>
+\t\t<string>${root}</string>
 \t</dict>
 \t<key>RunAtLoad</key>
 \t<true/>
@@ -147,14 +154,18 @@ export function buildSystemdUnit(
 	hash: string,
 	daemonCommand: string,
 ): string {
+	// systemd expands `%` specifiers in these values, and Environment= splits
+	// on unquoted spaces and reads C escapes inside quotes.
+	const root = projectRoot.replace(/%/g, '%%');
+	const envRoot = root.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 	return `[Unit]
-Description=nanocoder daemon for ${projectRoot}
+Description=nanocoder daemon for ${root}
 After=default.target
 
 [Service]
 Type=simple
-WorkingDirectory=${projectRoot}
-Environment=NANOCODER_PROJECT_ROOT=${projectRoot}
+WorkingDirectory=${root}
+Environment="NANOCODER_PROJECT_ROOT=${envRoot}"
 ExecStart=${daemonCommand} daemon start
 Restart=on-failure
 RestartSec=5
@@ -165,7 +176,8 @@ WantedBy=default.target
 }
 
 /**
- * XML escape for the fields we inject into the Task Scheduler manifest.
+ * XML escape for the fields we inject into the Task Scheduler manifest and
+ * the LaunchAgent plist.
  * Project paths can contain `&`, `<`, `'`, etc. in extreme cases.
  */
 function xmlEscape(value: string): string {
@@ -239,6 +251,24 @@ export async function installAutoStart(
 	const loadService = opts.loadService ?? true;
 	const hash = projectHash(opts.projectRoot);
 
+	// The installed service runs `nanocoder daemon start` unattended, on a
+	// restart-on-failure policy, in an environment that carries none of the
+	// interactive session's trust bypasses. If the project isn't in
+	// trustedDirectories, that start will fail its own trust gate forever.
+	// Install still succeeds - the file is useful once the project is
+	// trusted - but the result names both ways to fix it.
+	const preferences = loadPreferences();
+	const trusted = isDirectoryTrusted(opts.projectRoot, preferences);
+	const trustWarning = trusted
+		? ''
+		: ` Warning: ${resolve(opts.projectRoot)} ` +
+			untrustedReason(trustRecheck(opts.projectRoot, preferences)) +
+			`, so the ` +
+			`installed service will fail to start until this folder is trusted. ` +
+			`Run \`nanocoder\` here once to accept the trust disclaimer, or run ` +
+			`\`NANOCODER_TRUST_DIRECTORY=1 nanocoder daemon start\` here once to ` +
+			`save trust for the service.`;
+
 	if (platform === 'darwin') {
 		const target = launchAgentPath(home, hash);
 		mkdirSync(dirname(target), {recursive: true});
@@ -265,7 +295,7 @@ export async function installAutoStart(
 		return {
 			platform,
 			written: target,
-			message: `Auto-start installed for ${opts.projectRoot}.`,
+			message: `Auto-start installed for ${opts.projectRoot}.${trustWarning}`,
 		};
 	}
 
@@ -294,7 +324,7 @@ export async function installAutoStart(
 		return {
 			platform,
 			written: target,
-			message: `Auto-start installed for ${opts.projectRoot}.`,
+			message: `Auto-start installed for ${opts.projectRoot}.${trustWarning}`,
 		};
 	}
 
@@ -329,7 +359,7 @@ export async function installAutoStart(
 		return {
 			platform,
 			written: target,
-			message: `Auto-start installed for ${opts.projectRoot}.`,
+			message: `Auto-start installed for ${opts.projectRoot}.${trustWarning}`,
 		};
 	}
 

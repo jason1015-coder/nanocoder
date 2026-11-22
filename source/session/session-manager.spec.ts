@@ -1,7 +1,10 @@
 import {
+	mkdir,
 	mkdtemp,
+	open,
 	readFile,
 	readdir,
+	rename,
 	rm,
 	unlink,
 	writeFile,
@@ -9,7 +12,9 @@ import {
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'ava';
-import {SessionManager} from './session-manager.js';
+import {ArtifactManager} from '@/artifacts/artifact-manager';
+import {reloadAppConfig} from '@/config/index';
+import {SessionManager, setRenameForTests} from './session-manager.js';
 
 let testDir: string;
 let manager: SessionManager;
@@ -23,6 +28,9 @@ test.beforeEach(async () => {
 });
 
 test.afterEach(async () => {
+	// A test that fails mid-way must not leave the injected rename primitive in
+	// place for the next one.
+	setRenameForTests();
 	if (testDir) {
 		await rm(testDir, {recursive: true, force: true});
 	}
@@ -86,6 +94,22 @@ test.serial('createSession writes session file to disk', async t => {
 	t.is(parsed.title, 'Disk test');
 });
 
+test.serial('createSession can persist a preallocated session ID', async t => {
+	const id = '11111111-1111-4111-8111-111111111111';
+	const session = await manager.createSession({
+		id,
+		title: 'Preallocated session',
+		messageCount: 1,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [{role: 'user', content: 'hello'}],
+	});
+
+	t.is(session.id, id);
+	t.is((await manager.readSession(id))?.title, 'Preallocated session');
+});
+
 test.serial('createSession adds metadata to the index', async t => {
 	const session = await manager.createSession({
 		title: 'Index test',
@@ -104,6 +128,113 @@ test.serial('createSession adds metadata to the index', async t => {
 	t.is(sessions[0].id, session.id);
 	t.is(sessions[0].title, 'Index test');
 	t.is(sessions[0].messageCount, 2);
+});
+
+// Autosave recreates the live session with createSession() when its file
+// cannot be read. The index still has the entry, so what only the index knew
+// about the session must survive the recreate.
+async function recreateOverUnreadableFile(
+	id: string,
+	overrides: {title?: string; titleManuallySet?: boolean} = {},
+) {
+	await writeFile(join(sessionsDir, `${id}.json`), '{"truncated":');
+	return manager.createSession({
+		id,
+		title: overrides.title ?? 'Derived title',
+		titleManuallySet: overrides.titleManuallySet,
+		messageCount: 1,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [{role: 'user', content: 'hello'}],
+	});
+}
+
+test.serial(
+	'createSession over an indexed id keeps pinned and createdAt',
+	async t => {
+		const original = await manager.createSession(
+			newSessionData('Pinned session'),
+		);
+		await manager.setPinned(original.id, true);
+
+		const recreated = await recreateOverUnreadableFile(original.id);
+
+		t.true(recreated.pinned);
+		t.is(recreated.createdAt, original.createdAt);
+		const [entry] = await manager.listSessions();
+		t.true(entry.pinned);
+		t.is(entry.createdAt, original.createdAt);
+		t.true((await manager.readSession(original.id))?.pinned);
+	},
+);
+
+test.serial(
+	'createSession over an indexed id keeps a generated or renamed title',
+	async t => {
+		const generated = await manager.createSession(newSessionData('Derived title'));
+		await manager.saveSession({
+			...generated,
+			title: 'Generated title',
+			titleGenerated: true,
+		});
+		const renamed = await manager.createSession(newSessionData('Derived title'));
+		await manager.renameSession(renamed.id, 'Renamed title');
+
+		const regenerated = await recreateOverUnreadableFile(generated.id);
+		const rerenamed = await recreateOverUnreadableFile(renamed.id);
+
+		t.is(regenerated.title, 'Generated title');
+		t.true(regenerated.titleGenerated);
+		t.is(rerenamed.title, 'Renamed title');
+		t.true(rerenamed.titleManuallySet);
+	},
+);
+
+test.serial(
+	'createSession over an indexed id applies a rename passed by the caller',
+	async t => {
+		const original = await manager.createSession(newSessionData('Derived title'));
+		await manager.saveSession({
+			...original,
+			title: 'Generated title',
+			titleGenerated: true,
+		});
+
+		const recreated = await recreateOverUnreadableFile(original.id, {
+			title: 'Pending rename',
+			titleManuallySet: true,
+		});
+
+		t.is(recreated.title, 'Pending rename');
+		t.true(recreated.titleManuallySet);
+	},
+);
+
+test.serial(
+	'createSession over an indexed id takes the new title when the old one was only derived',
+	async t => {
+		const original = await manager.createSession(newSessionData('Old derived'));
+
+		const recreated = await recreateOverUnreadableFile(original.id, {
+			title: 'New derived',
+		});
+
+		t.is(recreated.title, 'New derived');
+		t.falsy(recreated.titleManuallySet);
+		t.falsy(recreated.titleGenerated);
+	},
+);
+
+test.serial('createSession honours a pin passed by the caller', async t => {
+	const session = await manager.createSession({
+		...newSessionData('Pinned at creation'),
+		pinned: true,
+	});
+
+	t.true(session.pinned);
+	t.true((await manager.listSessions())[0].pinned);
+	t.true((await manager.readSession(session.id))?.pinned);
 });
 
 // --- readSession ---
@@ -198,6 +329,62 @@ test.serial('saveSession updates an existing session', async t => {
 	t.is(loaded!.messages.length, 2);
 });
 
+test.serial('saveSession round-trips the displayOnly flag', async t => {
+	// A resumed session must keep harness notices marked; losing the flag on
+	// disk would let them re-enter the provider payload on the next turn.
+	const session = await manager.createSession({
+		title: 'Notices',
+		messageCount: 2,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [
+			{role: 'user', content: 'go'},
+			{
+				role: 'assistant',
+				content: '_Cancelled by user._',
+				displayOnly: true,
+			},
+		],
+	});
+
+	const loaded = await manager.readSession(session.id);
+	t.is(loaded!.messages.length, 2);
+	t.is(loaded!.messages[0].displayOnly, undefined);
+	t.true(loaded!.messages[1].displayOnly);
+});
+
+test.serial('saveSession round-trips optional response usage', async t => {
+	const session = await manager.createSession({
+		title: 'Usage',
+		messageCount: 2,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [
+			{role: 'user', content: 'hello'},
+			{
+				role: 'assistant',
+				content: 'hi',
+				responseUsage: {
+					inputTokens: 100,
+					outputTokens: 20,
+					totalTokens: 120,
+					cost: 0.002,
+				},
+			},
+		],
+	});
+
+	const loaded = await manager.readSession(session.id);
+	t.deepEqual(loaded!.messages[1].responseUsage, {
+		inputTokens: 100,
+		outputTokens: 20,
+		totalTokens: 120,
+		cost: 0.002,
+	});
+});
+
 test.serial('saveSession rejects invalid session ID', async t => {
 	await t.throwsAsync(
 		() =>
@@ -257,6 +444,25 @@ test.serial(
 		await t.notThrowsAsync(() => manager.deleteSession(session.id));
 	},
 );
+
+test.serial('deleteSession removes the session artifacts', async t => {
+	const artifacts = new ArtifactManager(join(testDir, 'artifacts'));
+	const coupledManager = new SessionManager(sessionsDir, artifacts);
+	await coupledManager.initialize();
+	const session = await coupledManager.createSession({
+		title: 'Delete artifacts',
+		messageCount: 0,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [],
+	});
+	await artifacts.writeArtifact(session.id, 'implementation_plan', '# Plan\n');
+
+	await coupledManager.deleteSession(session.id);
+
+	t.is(await artifacts.readArtifact(session.id, 'implementation_plan'), null);
+});
 
 test.serial('deleteSession rejects invalid ID', async t => {
 	await t.throwsAsync(() => manager.deleteSession('bad-id'), {
@@ -495,6 +701,103 @@ test.serial(
 	},
 );
 
+function renameError(code: string): NodeJS.ErrnoException {
+	const error = new Error(
+		`${code}: injected rename failure`,
+	) as NodeJS.ErrnoException;
+	error.code = code;
+	return error;
+}
+
+const retrySessionData = {
+	title: 'Retry test',
+	messageCount: 0,
+	provider: 'test',
+	model: 'test',
+	workingDirectory: '/tmp',
+	messages: [],
+};
+
+test.serial('saveSession retries a transient EPERM rename and succeeds', async t => {
+	const indexPath = join(sessionsDir, 'sessions.json');
+	let indexFailures = 0;
+
+	setRenameForTests(async (from, to) => {
+		if (to === indexPath && indexFailures < 2) {
+			indexFailures++;
+			throw renameError('EPERM');
+		}
+		await rename(from, to);
+	});
+
+	const session = await manager.createSession(retrySessionData);
+
+	t.is(indexFailures, 2, 'the index rename should have been retried twice');
+	const index = JSON.parse(await readFile(indexPath, 'utf-8')) as Array<{
+		id: string;
+	}>;
+	t.true(index.some(entry => entry.id === session.id));
+	const tmpFiles = (await readdir(sessionsDir)).filter(e => e.endsWith('.tmp'));
+	t.is(tmpFiles.length, 0, 'no temp file should survive a successful retry');
+});
+
+test.serial('saveSession does not retry a permanent rename error', async t => {
+	let attempts = 0;
+
+	setRenameForTests(async () => {
+		attempts++;
+		throw renameError('ENOSPC');
+	});
+
+	await t.throwsAsync(manager.createSession(retrySessionData), {code: 'ENOSPC'});
+	t.is(attempts, 1, 'a non-retryable errno must surface on the first attempt');
+	const tmpFiles = (await readdir(sessionsDir)).filter(e => e.endsWith('.tmp'));
+	t.is(tmpFiles.length, 0, 'the temp file must be cleaned up on failure');
+});
+
+test.serial('saveSession gives up after the retry budget', async t => {
+	let attempts = 0;
+
+	setRenameForTests(async () => {
+		attempts++;
+		throw renameError('EPERM');
+	});
+
+	await t.throwsAsync(manager.createSession(retrySessionData), {code: 'EPERM'});
+	t.is(attempts, 6, 'one initial attempt plus five retries');
+});
+
+(process.platform === 'win32' ? test.serial : test.skip)(
+	'saveSession survives an index reader holding the file open (Windows sharing violation)',
+	async t => {
+		const indexPath = join(sessionsDir, 'sessions.json');
+		const handle = await open(indexPath, 'r');
+		let closed = false;
+
+		try {
+			const pending = manager.createSession(retrySessionData);
+			// Let the first index rename hit the sharing violation, then let go:
+			// this is the shape of the reported bug, where the reader lives in a
+			// second Nanocoder process and closes the file milliseconds later.
+			await new Promise<void>(resolve => {
+				setTimeout(resolve, 5);
+			});
+			await handle.close();
+			closed = true;
+
+			const session = await pending;
+			const index = JSON.parse(await readFile(indexPath, 'utf-8')) as Array<{
+				id: string;
+			}>;
+			t.true(index.some(entry => entry.id === session.id));
+		} finally {
+			if (!closed) {
+				await handle.close().catch(() => {});
+			}
+		}
+	},
+);
+
 // --- index recovery ---
 
 test.serial(
@@ -611,32 +914,85 @@ test.serial(
 // --- enforceSessionLimits ---
 
 test.serial(
-	'enforceSessionLimits deletes oldest sessions when over limit',
+	'enforceSessionLimits deletes oldest sessions and their artifacts when over limit',
 	async t => {
-		// Use a separate manager with overrideDir to avoid config interference
-		const limitDir = join(testDir, 'limit-test');
-		const limitManager = new SessionManager(limitDir);
-		await limitManager.initialize();
+		const prevConfigDir = process.env.NANOCODER_CONFIG_DIR;
+		const customConfigDir = join(testDir, 'config');
+		await mkdir(customConfigDir, {recursive: true});
+		process.env.NANOCODER_CONFIG_DIR = customConfigDir;
 
-		// Create 5 sessions with staggered timestamps
-		const ids: string[] = [];
-		for (let i = 0; i < 5; i++) {
-			const session = await limitManager.createSession({
-				title: `Session ${i}`,
-				messageCount: 0,
-				provider: 'test',
-				model: 'test',
-				workingDirectory: '/tmp',
-				messages: [],
-			});
-			ids.push(session.id);
-			// Small delay for distinct timestamps
-			await new Promise(r => setTimeout(r, 5));
+		try {
+			await writeFile(
+				join(customConfigDir, 'nanocoder-preferences.json'),
+				JSON.stringify({
+					nanocoder: {
+						sessions: {
+							maxSessions: 2,
+						},
+					},
+				}),
+				'utf-8',
+			);
+			reloadAppConfig();
+
+			const limitDir = join(testDir, 'limit-test');
+			const artifacts = new ArtifactManager(join(testDir, 'limit-artifacts'));
+			const limitManager = new SessionManager(limitDir, artifacts);
+			await limitManager.initialize();
+
+			// Create 3 sessions with staggered timestamps and write artifacts for each
+			const ids: string[] = [];
+			for (let i = 0; i < 3; i++) {
+				const session = await limitManager.createSession({
+					title: `Session ${i}`,
+					messageCount: 0,
+					provider: 'test',
+					model: 'test',
+					workingDirectory: '/tmp',
+					messages: [],
+				});
+				ids.push(session.id);
+				await artifacts.writeArtifact(
+					session.id,
+					'implementation_plan',
+					`# Plan for session ${i}\n`,
+				);
+				// Small delay for distinct timestamps
+				await new Promise(r => setTimeout(r, 10));
+			}
+
+			// Since maxSessions is 2, creating the 3rd session triggers enforceSessionLimits
+			// and trims the oldest session (ids[0])
+			const sessions = await limitManager.listSessions();
+			t.is(sessions.length, 2);
+			t.false(sessions.some(s => s.id === ids[0]));
+			t.true(sessions.some(s => s.id === ids[1]));
+			t.true(sessions.some(s => s.id === ids[2]));
+
+			// Oldest session's JSON file should be unlinked
+			const oldestFile = await limitManager.readSession(ids[0]);
+			t.is(oldestFile, null);
+
+			// Oldest session's artifact directory should be deleted
+			const oldestArtifact = await artifacts.readArtifact(
+				ids[0],
+				'implementation_plan',
+			);
+			t.is(oldestArtifact, null);
+
+			// Remaining sessions' files and artifacts should remain intact
+			t.truthy(await limitManager.readSession(ids[1]));
+			t.truthy(await limitManager.readSession(ids[2]));
+			t.truthy(await artifacts.readArtifact(ids[1], 'implementation_plan'));
+			t.truthy(await artifacts.readArtifact(ids[2], 'implementation_plan'));
+		} finally {
+			if (prevConfigDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = prevConfigDir;
+			}
+			reloadAppConfig();
 		}
-
-		// Default maxSessions is 100, so all 5 should be present
-		const sessions = await limitManager.listSessions();
-		t.is(sessions.length, 5);
 	},
 );
 
@@ -662,9 +1018,15 @@ test.serial(
 		oldDate.setDate(oldDate.getDate() - 60);
 		index[0].lastAccessedAt = oldDate.toISOString();
 		await writeFile(indexPath, JSON.stringify(index), 'utf-8');
+		const artifacts = new ArtifactManager(join(testDir, 'artifacts'));
+		await artifacts.writeArtifact(
+			session.id,
+			'implementation_plan',
+			'# Old plan\n',
+		);
 
 		// Re-initialize to trigger cleanup (default retention is 30 days)
-		const mgr2 = new SessionManager(sessionsDir);
+		const mgr2 = new SessionManager(sessionsDir, artifacts);
 		await mgr2.initialize();
 
 		const sessions = await mgr2.listSessions();
@@ -673,6 +1035,7 @@ test.serial(
 		// File should also be deleted
 		const result = await mgr2.readSession(session.id);
 		t.is(result, null);
+		t.is(await artifacts.readArtifact(session.id, 'implementation_plan'), null);
 	},
 );
 
@@ -852,3 +1215,364 @@ test.serial(
 		t.is(jsonFiles.length, sessions.length);
 	},
 );
+
+// --- saveSession (lastAccessedAt) ---
+
+test.serial(
+	'saveSession trusts the caller-supplied lastAccessedAt (does not force "now")',
+	async t => {
+		// Callers (autosave, renameSession, and test helpers that simulate
+		// time passing) rely on being able to set an explicit lastAccessedAt
+		// via saveSession(). It must not silently override that value.
+		const session = await manager.createSession({
+			title: 'Explicit timestamp test',
+			messageCount: 1,
+			provider: 'test',
+			model: 'test',
+			workingDirectory: '/tmp',
+			messages: [{role: 'user', content: 'hi'}],
+		});
+
+		const explicitPast = new Date(Date.now() - 60_000).toISOString();
+		await manager.saveSession({...session, lastAccessedAt: explicitPast});
+
+		const loaded = await manager.readSession(session.id);
+		t.is(loaded!.lastAccessedAt, explicitPast);
+
+		const [indexed] = await manager.listSessions();
+		t.is(indexed.lastAccessedAt, explicitPast);
+	},
+);
+
+// --- renameSession ---
+
+test.serial('renameSession persists the new title and sets the flag', async t => {
+	const session = await manager.createSession({
+		title: 'Original title',
+		messageCount: 0,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [],
+	});
+
+	const originalLastAccessed = session.lastAccessedAt;
+	await new Promise(r => setTimeout(r, 10));
+
+	const renamed = await manager.renameSession(session.id, 'New title');
+	t.truthy(renamed);
+	t.is(renamed!.title, 'New title');
+	t.is(renamed!.titleManuallySet, true);
+	t.not(renamed!.lastAccessedAt, originalLastAccessed);
+
+	const loaded = await manager.readSession(session.id);
+	t.is(loaded!.title, 'New title');
+	t.is(loaded!.titleManuallySet, true);
+});
+
+test.serial('renameSession trims surrounding whitespace', async t => {
+	const session = await manager.createSession({
+		title: 'Original',
+		messageCount: 0,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [],
+	});
+
+	const renamed = await manager.renameSession(session.id, '  Trimmed  ');
+	t.is(renamed!.title, 'Trimmed');
+});
+
+test.serial('renameSession rejects an empty title', async t => {
+	const session = await manager.createSession({
+		title: 'Original',
+		messageCount: 0,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [],
+	});
+
+	await t.throwsAsync(() => manager.renameSession(session.id, '   '), {
+		message: /cannot be empty/,
+	});
+});
+
+test.serial('renameSession rejects an over-length title', async t => {
+	const session = await manager.createSession({
+		title: 'Original',
+		messageCount: 0,
+		provider: 'test',
+		model: 'test',
+		workingDirectory: '/tmp',
+		messages: [],
+	});
+
+	await t.throwsAsync(
+		() => manager.renameSession(session.id, 'x'.repeat(101)),
+		{message: /100 characters or less/},
+	);
+});
+
+test.serial('renameSession returns null for a non-existent session', async t => {
+	const result = await manager.renameSession(
+		'00000000-0000-0000-0000-000000000000',
+		'New title',
+	);
+	t.is(result, null);
+});
+
+test.serial(
+	'renameSession-set title survives a later autosave-style save',
+	async t => {
+		const session = await manager.createSession({
+			title: 'Original',
+			messageCount: 0,
+			provider: 'test',
+			model: 'test',
+			workingDirectory: '/tmp',
+			messages: [],
+		});
+
+		const renamed = await manager.renameSession(session.id, 'Kept title');
+		t.truthy(renamed);
+
+		// Simulate autosave deriving a new title from the latest message,
+		// but respecting titleManuallySet (same guard as useSessionAutosave.ts).
+		const reread = await manager.readSession(session.id);
+		if (!reread!.titleManuallySet) {
+			reread!.title = 'Auto-derived title';
+		}
+		await manager.saveSession(reread!);
+
+		const loaded = await manager.readSession(session.id);
+		t.is(loaded!.title, 'Kept title');
+	},
+);
+
+test('titleGenerated round-trips through save and read', async t => {
+	const session = await manager.createSession({
+		title: 'hi',
+		messageCount: 1,
+		provider: 'ollama',
+		model: 'qwen3',
+		workingDirectory: '/tmp',
+		messages: [{role: 'user', content: 'hi'}],
+	});
+
+	await manager.saveSession({
+		...session,
+		title: 'Fix Login Bug',
+		titleGenerated: true,
+	});
+
+	const reloaded = await manager.readSession(session.id);
+	t.is(reloaded?.title, 'Fix Login Bug');
+	t.true(reloaded?.titleGenerated);
+});
+
+test('titleGenerated survives an index rebuild', async t => {
+	const session = await manager.createSession({
+		title: 'hi',
+		messageCount: 1,
+		provider: 'ollama',
+		model: 'qwen3',
+		workingDirectory: '/tmp',
+		messages: [{role: 'user', content: 'hi'}],
+	});
+	await manager.saveSession({
+		...session,
+		title: 'Fix Login Bug',
+		titleGenerated: true,
+	});
+
+	// Corrupt the index so listSessions is forced to rebuild it from the
+	// session files on disk. rebuildIndex hand-lists every metadata field,
+	// so a field missing there is dropped silently.
+	await writeFile(join(sessionsDir, 'sessions.json'), 'not json at all');
+
+	const listed = await manager.listSessions();
+	const found = listed.find(s => s.id === session.id);
+	t.truthy(found);
+	t.true(found?.titleGenerated);
+});
+
+test('titleManuallySet also survives an index rebuild', async t => {
+	const session = await manager.createSession({
+		title: 'hi',
+		messageCount: 1,
+		provider: 'ollama',
+		model: 'qwen3',
+		workingDirectory: '/tmp',
+		messages: [{role: 'user', content: 'hi'}],
+	});
+	await manager.renameSession(session.id, 'My Own Name');
+
+	await writeFile(join(sessionsDir, 'sessions.json'), 'not json at all');
+
+	const listed = await manager.listSessions();
+	const found = listed.find(s => s.id === session.id);
+	t.is(found?.title, 'My Own Name');
+	t.true(found?.titleManuallySet);
+});
+
+// --- pinned sessions ---
+
+const newSessionData = (title: string) => ({
+	title,
+	messageCount: 0,
+	provider: 'test',
+	model: 'test',
+	workingDirectory: '/tmp',
+	messages: [],
+});
+
+test.serial('setPinned marks and clears a session in the file and the index', async t => {
+	const session = await manager.createSession(newSessionData('Thread'));
+
+	t.truthy(await manager.setPinned(session.id, true));
+	t.true((await manager.readSession(session.id))?.pinned);
+	t.true((await manager.listSessions())[0].pinned);
+
+	// Autosave rewrites the session from what it read, so the mark rides along.
+	const read = await manager.readSession(session.id);
+	await manager.saveSession({...read!, messageCount: 3});
+	t.true((await manager.readSession(session.id))?.pinned);
+
+	await manager.setPinned(session.id, false);
+	t.is((await manager.readSession(session.id))?.pinned, undefined);
+	t.falsy((await manager.listSessions())[0].pinned);
+});
+
+test.serial('setPinned survives an index rebuild, rename and a fresh load', async t => {
+	const session = await manager.createSession(newSessionData('Thread'));
+	await manager.setPinned(session.id, true);
+	await manager.renameSession(session.id, 'Renamed');
+	t.true((await manager.loadSession(session.id))?.pinned);
+
+	await writeFile(join(sessionsDir, 'sessions.json'), 'not json at all');
+	t.true((await manager.listSessions())[0].pinned);
+});
+
+test.serial('setPinned returns null for a session that does not exist', async t => {
+	t.is(await manager.setPinned('00000000-0000-4000-8000-000000000000', true), null);
+	t.is(await manager.setPinned('../escape', true), null);
+});
+
+test.serial('setPinned gives an unpinned session a fresh retention window', async t => {
+	const session = await manager.createSession(newSessionData('Old thread'));
+	const stale = await manager.createSession(newSessionData('Never touched'));
+	await manager.setPinned(session.id, true);
+
+	// setPinned reads the session file, not the index, and rewrites the index
+	// from it. So both must be old: aging only the index would be undone by the
+	// first save and leave the refresh untested.
+	const old = new Date(Date.now() - 60 * 86_400_000).toISOString();
+	for (const id of [session.id, stale.id]) {
+		const file = join(sessionsDir, `${id}.json`);
+		const data = JSON.parse(await readFile(file, 'utf-8'));
+		data.lastAccessedAt = old;
+		await writeFile(file, JSON.stringify(data), 'utf-8');
+	}
+	const indexPath = join(sessionsDir, 'sessions.json');
+	const index = JSON.parse(await readFile(indexPath, 'utf-8'));
+	for (const entry of index) entry.lastAccessedAt = old;
+	await writeFile(indexPath, JSON.stringify(index), 'utf-8');
+
+	await manager.setPinned(session.id, false);
+
+	// A new process starting is what runs the cleanup. The unpinned session was
+	// refreshed; the one nobody touched is as old as it looks and is removed.
+	const mgr2 = new SessionManager(sessionsDir);
+	await mgr2.initialize();
+	t.deepEqual((await mgr2.listSessions()).map(s => s.id), [session.id]);
+});
+
+test.serial('cleanupOldSessions keeps a pinned session and still removes the unpinned ones', async t => {
+	const artifacts = new ArtifactManager(join(testDir, 'pinned-artifacts'));
+	const mgr = new SessionManager(sessionsDir, artifacts);
+	await mgr.initialize();
+	const pinned = await mgr.createSession(newSessionData('Pinned'));
+	const unpinned = await mgr.createSession(newSessionData('Unpinned'));
+	await mgr.setPinned(pinned.id, true);
+	await artifacts.writeArtifact(pinned.id, 'implementation_plan', '# Keep\n');
+	await artifacts.writeArtifact(unpinned.id, 'implementation_plan', '# Drop\n');
+
+	// Both sit past the 30 day default.
+	const indexPath = join(sessionsDir, 'sessions.json');
+	const index = JSON.parse(await readFile(indexPath, 'utf-8'));
+	for (const entry of index) {
+		entry.lastAccessedAt = new Date(Date.now() - 60 * 86_400_000).toISOString();
+	}
+	await writeFile(indexPath, JSON.stringify(index), 'utf-8');
+
+	// A new process starting is what runs the cleanup.
+	const restarted = new SessionManager(sessionsDir, artifacts);
+	await restarted.initialize();
+
+	t.deepEqual((await restarted.listSessions()).map(s => s.id), [pinned.id]);
+	t.truthy(await restarted.loadSession(pinned.id));
+	t.truthy(await artifacts.readArtifact(pinned.id, 'implementation_plan'));
+	t.is(await restarted.readSession(unpinned.id), null);
+	t.is(await artifacts.readArtifact(unpinned.id, 'implementation_plan'), null);
+});
+
+test.serial('enforceSessionLimits does not count or remove pinned sessions', async t => {
+	const prevConfigDir = process.env.NANOCODER_CONFIG_DIR;
+	const customConfigDir = join(testDir, 'config');
+	await mkdir(customConfigDir, {recursive: true});
+	process.env.NANOCODER_CONFIG_DIR = customConfigDir;
+
+	try {
+		await writeFile(
+			join(customConfigDir, 'nanocoder-preferences.json'),
+			JSON.stringify({nanocoder: {sessions: {maxSessions: 2, retentionDays: 7}}}),
+			'utf-8',
+		);
+		reloadAppConfig();
+
+		const mgr = new SessionManager(join(testDir, 'limit-pinned'));
+		await mgr.initialize();
+		t.deepEqual(mgr.getRetention(), {retentionDays: 7, maxSessions: 2});
+
+		const pinned = await mgr.createSession(newSessionData('Pinned'));
+		await mgr.setPinned(pinned.id, true);
+		// The oldest by access, so it would go first if it were not pinned.
+		const index = JSON.parse(await readFile(join(testDir, 'limit-pinned', 'sessions.json'), 'utf-8'));
+		index[0].lastAccessedAt = new Date(Date.now() - 86_400_000).toISOString();
+		await writeFile(join(testDir, 'limit-pinned', 'sessions.json'), JSON.stringify(index), 'utf-8');
+
+		const ids: string[] = [];
+		for (let i = 0; i < 3; i++) {
+			ids.push((await mgr.createSession(newSessionData(`Session ${i}`))).id);
+		}
+
+		// Two unpinned fit the limit of 2 next to the pinned one; the third
+		// pushed out only the oldest unpinned session.
+		const remaining = (await mgr.listSessions()).map(s => s.id).sort();
+		t.deepEqual(remaining, [pinned.id, ids[1], ids[2]].sort());
+	} finally {
+		if (prevConfigDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = prevConfigDir;
+		}
+		reloadAppConfig();
+	}
+});
+
+test.serial('deleteSession still removes a pinned session and its artifacts', async t => {
+	const artifacts = new ArtifactManager(join(testDir, 'delete-artifacts'));
+	const mgr = new SessionManager(sessionsDir, artifacts);
+	await mgr.initialize();
+	const session = await mgr.createSession(newSessionData('Pinned'));
+	await mgr.setPinned(session.id, true);
+	await artifacts.writeArtifact(session.id, 'implementation_plan', '# Plan\n');
+
+	await mgr.deleteSession(session.id);
+
+	t.is(await mgr.readSession(session.id), null);
+	t.deepEqual(await mgr.listSessions(), []);
+	t.is(await artifacts.readArtifact(session.id, 'implementation_plan'), null);
+});

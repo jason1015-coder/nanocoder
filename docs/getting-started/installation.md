@@ -30,6 +30,12 @@ First, tap the repository:
 brew tap nano-collective/nanocoder https://github.com/Nano-Collective/nanocoder
 ```
 
+For Homebrew 6.x+ (and other setups that require a trusted third-party tap), trust the tap before installing:
+
+```bash
+brew trust nano-collective/nanocoder
+```
+
 Then install:
 
 ```bash
@@ -120,7 +126,7 @@ pnpm run build
 pnpm run start
 ```
 
-Or build and run in one command:
+For development, recompile on every change (this only compiles; run `pnpm run start` in another terminal to launch):
 
 ```bash
 pnpm run dev

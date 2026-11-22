@@ -1,0 +1,663 @@
+import * as vscode from 'vscode';
+import {ClientSideConnection} from '@agentclientprotocol/sdk';
+import {ACP_EXT_PREFIX, type ACP_EXT_METHODS, VSCODE_CLIENT_NAME} from '../../../source/acp/acp-capabilities';
+import {AcpStateManager, ACPStatus} from './acp-state';
+import {PromptAttempt} from './prompt-attempt';
+import { resolveExtensionCwd } from './workspace-utils';
+
+// We expect at least the version of the CLI where ACP was introduced
+const MINIMUM_CLI_VERSION = '0.4.0';
+
+export interface StateSyncPayload {
+	mode?: string;
+	availableModes: string[];
+	model?: string;
+	availableModels: string[];
+	provider?: string;
+	availableProviders: string[];
+}
+
+/**
+ * Outcome of a provider or model switch, so the UI only reports what really
+ * happened. `persistError` is set when the session switched but saving the
+ * VS Code setting failed.
+ */
+export type ConfigSwitchResult =
+	| {ok: true; persistError?: string}
+	| {ok: false; error: string};
+
+const NOT_CONNECTED = 'not connected to the Nanocoder agent';
+const NO_SESSION = 'no active session';
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+export class NanocoderAcpClient {
+	public connection: ClientSideConnection | null = null;
+	private outputChannel: vscode.OutputChannel;
+	private stateManager: AcpStateManager;
+	private _sessionId?: string;
+	private _lastActiveSessionId?: string;
+
+	get sessionId(): string | undefined {
+		return this._sessionId;
+	}
+
+	get lastActiveSessionId(): string | undefined {
+		return this._lastActiveSessionId;
+	}
+
+	set lastActiveSessionId(id: string | undefined) {
+		this._lastActiveSessionId = id;
+	}
+	/** In-flight {@link getOrCreateSession} promise; coalesces overlapping callers. */
+	private _pendingSession: Promise<string | undefined> | null = null;
+	/**
+	 * Bumped whenever the session is cleared or replaced other than by creation
+	 * (New Chat, a reconnect, a resume). A creation that started under an older
+	 * value belongs to a conversation the user has left, so its result is
+	 * dropped instead of being written back over the new state.
+	 */
+	private _sessionGeneration = 0;
+	public onSessionUpdate?: (update: unknown) => void;
+	public onPermissionRequested?: (toolCallId: string, toolCall: unknown, options?: any[]) => void;
+	/** Fires with the tool call ids whose approval cards should be dismissed. */
+	public onPermissionsCancelled?: (toolCallIds: string[]) => void;
+	public onStateSync?: (state: StateSyncPayload) => void;
+	public onSessionArtifacts?: (meta: unknown) => void;
+	public onConnectionReady?: () => void;
+	/** Fires when a background title update is received. */
+	public onSessionTitleChanged?: () => void;
+
+	public currentMode?: string;
+	public availableModes: string[] = [];
+	public currentModel?: string;
+	public availableModels: string[] = [];
+	public currentProvider?: string;
+	public availableProviders: string[] = [];
+
+	/**
+	 * True only after `initialize()` has succeeded on the current connection.
+	 * `connection` is set earlier, when stdio is wired — using that as a ready
+	 * signal lets `newSession` race the handshake and fail silently.
+	 */
+	private _handshakeComplete = false;
+	/** Whether the agent advertised `sessionCapabilities.close` at initialize. */
+	private _supportsSessionClose = false;
+	/** Extension request names the agent advertised at initialize. */
+	private _extMethods: readonly string[] = [];
+
+	get isHandshakeComplete(): boolean {
+		return this._handshakeComplete && this.connection != null;
+	}
+
+	private pendingPermissions = new Map<string, (response: unknown) => void>();
+	private activePrompt?: PromptAttempt;
+
+	constructor(outputChannel: vscode.OutputChannel, stateManager: AcpStateManager) {
+		this.outputChannel = outputChannel;
+		this.stateManager = stateManager;
+
+		// Settings Bridge: Listen for configuration changes
+		vscode.workspace.onDidChangeConfiguration((e) => {
+			if (e.affectsConfiguration('nanocoder.mode')) {
+				const newMode = vscode.workspace.getConfiguration('nanocoder').get<string>('mode');
+				if (newMode && newMode !== this.currentMode) {
+					this.setSessionMode(newMode, false);
+				}
+			}
+			if (e.affectsConfiguration('nanocoder.model')) {
+				const newModel = vscode.workspace.getConfiguration('nanocoder').get<string>('model');
+				// Without a session the new value is applied when one is created.
+				if (newModel && newModel !== this.currentModel && this.connection && this._sessionId) {
+					void this._applyModelSetting(newModel);
+				}
+			}
+		});
+
+	}
+
+	notifyActiveEditorChanged(editor: vscode.TextEditor | undefined) {
+		if (editor && this.connection && this._sessionId) {
+			const uri = editor.document.uri.toString();
+			const cursorPos = editor.selection.active;
+			const visibleRange = editor.visibleRanges[0];
+			const range = visibleRange ?? new vscode.Range(cursorPos, cursorPos);
+			this.connection.unstable_didFocusDocument({
+				sessionId: this._sessionId,
+				uri,
+				version: editor.document.version,
+				position: { line: cursorPos.line, character: cursorPos.character },
+				visibleRange: {
+					start: { line: range.start.line, character: range.start.character },
+					end: { line: range.end.line, character: range.end.character },
+				},
+			}).catch(() => { /* best-effort */ });
+		}
+	}
+
+	hasPendingPermissions(): boolean {
+		return this.pendingPermissions.size > 0;
+	}
+
+	hasActivePrompt(): boolean {
+		return this.activePrompt !== undefined;
+	}
+
+	setConnection(connection: ClientSideConnection): void {
+		this.connection = connection;
+		if (this._sessionId) {
+			this._lastActiveSessionId = this._sessionId;
+		}
+		this._sessionId = undefined; // Clear any stale session to force re-creation
+		this._abandonPendingSession();
+		this._clearPendingPermissions();
+		this._handshakeComplete = false;
+		this._supportsSessionClose = false;
+		this._extMethods = [];
+	}
+
+	/** Drop any in-flight session creation; see {@link _sessionGeneration}. */
+	private _abandonPendingSession(): void {
+		this._sessionGeneration++;
+		this._pendingSession = null;
+	}
+
+	/** Handle custom notifications from the agent. */
+	async handleExtNotification(method: string, _params: unknown): Promise<void> {
+		if (method === '_nanocoder/sessionTitleChanged') {
+			this.onSessionTitleChanged?.();
+		}
+	}
+
+	async handlePermissionRequest(params: any): Promise<unknown> {
+		const toolCall = params.toolCall;
+		const toolCallId = toolCall.toolCallId;
+		
+		return new Promise<unknown>((resolve) => {
+			this.pendingPermissions.set(toolCallId, resolve);
+			if (this.onPermissionRequested) {
+				this.onPermissionRequested(toolCallId, toolCall, params.options);
+			}
+		});
+	}
+
+	/**
+	 * Answer every outstanding permission request with `cancelled` and drop it.
+	 * A leftover resolver keeps hasPendingPermissions() true, which blocks every
+	 * later message until the window reloads.
+	 */
+	private _clearPendingPermissions(): void {
+		if (this.pendingPermissions.size === 0) return;
+
+		const toolCallIds = [...this.pendingPermissions.keys()];
+		for (const resolve of this.pendingPermissions.values()) {
+			resolve({outcome: {outcome: 'cancelled'}});
+		}
+		this.pendingPermissions.clear();
+
+		if (this.onPermissionsCancelled) {
+			this.onPermissionsCancelled(toolCallIds);
+		}
+	}
+
+	resolvePermission(toolCallId: string, allowOrOptionId: boolean | string) {
+		const resolver = this.pendingPermissions.get(toolCallId);
+		if (resolver) {
+			resolver({
+				outcome: {
+					outcome: 'selected',
+					optionId: typeof allowOrOptionId === 'string' ? allowOrOptionId : (allowOrOptionId ? 'allow' : 'deny'),
+				}
+			});
+			this.pendingPermissions.delete(toolCallId);
+		}
+	}
+
+	async initializeHandshake(): Promise<boolean> {
+		if (!this.connection) return false;
+
+		try {
+			const ext = vscode.extensions.getExtension('nanocollective.nanocoder-vscode');
+			const version = ext?.packageJSON?.version || '0.4.0';
+
+			// Perform ACP initialize handshake
+			const initResult = await this.connection.initialize({
+				clientInfo: {
+					name: VSCODE_CLIENT_NAME,
+					version: version,
+				},
+				protocolVersion: 1,
+				clientCapabilities: {},
+			});
+
+			this.outputChannel.appendLine(`ACP Initialized. Agent version: ${initResult.agentInfo?.version || 'unknown'}`);
+
+			// Version validation
+			if (this.isVersionIncompatible(initResult.agentInfo?.version || '0.0.0')) {
+				this.stateManager.setStatus(ACPStatus.VersionMismatch);
+				vscode.window.showWarningMessage(
+					`Nanocoder CLI version ${initResult.agentInfo?.version} is incompatible with this extension. Please update to >= ${MINIMUM_CLI_VERSION}.`
+				);
+				return false;
+			}
+
+			this._supportsSessionClose =
+				initResult.agentCapabilities?.sessionCapabilities?.close != null;
+			const advertised = (initResult.agentCapabilities?._meta?.nanocoder as
+				| { extMethods?: unknown }
+				| undefined)?.extMethods;
+			this._extMethods = Array.isArray(advertised) ? advertised : [];
+
+			// Complete handshake
+			this._handshakeComplete = true;
+			this.stateManager.setStatus(ACPStatus.Connected);
+			if (this.onConnectionReady) {
+				this.onConnectionReady();
+			}
+			return true;
+		} catch (error) {
+			this.outputChannel.appendLine(`ACP Initialize failed: ${error}`);
+			return false;
+		}
+	}
+
+	async getOrCreateSession(cwd: string): Promise<string | undefined> {
+		if (this._sessionId) {
+			this.notifyStateSync();
+			return this._sessionId;
+		}
+		if (!this.connection) return undefined;
+		// Coalesce overlapping callers. Without this, a click on "Send" racing
+		// the auto-init from `onConnectionReady` would each call newSession()
+		// against the shared connection; the second writer overwrites the
+		// first `_sessionId` and the first session is orphaned with its mode
+		// and configOptions already read into local state.
+		const generation = this._sessionGeneration;
+		let pending = this._pendingSession;
+		if (!pending) {
+			pending = this._createSession(cwd, generation);
+			this._pendingSession = pending;
+		}
+		let sessionId: string | undefined;
+		try {
+			sessionId = await pending;
+		} finally {
+			if (this._pendingSession === pending) {
+				this._pendingSession = null;
+			}
+		}
+		// New Chat, a resume or a reconnect happened while this was in flight,
+		// so the caller wants the current conversation's session. After a
+		// reconnect the new process creates its own once the handshake is done.
+		if (generation !== this._sessionGeneration) {
+			return this.isHandshakeComplete ? this.getOrCreateSession(cwd) : undefined;
+		}
+		return sessionId;
+	}
+
+	private async _createSession(
+		cwd: string,
+		generation: number,
+	): Promise<string | undefined> {
+		try {
+			// Get VS Code settings for initial preferences
+			const config = vscode.workspace.getConfiguration('nanocoder');
+			const initialMode = config.get<string>('mode') || 'auto-accept';
+			const initialModel = config.get<string>('model');
+
+			const result = await this.connection!.newSession({ cwd, mcpServers: [] });
+			if (generation !== this._sessionGeneration) {
+				this.outputChannel.appendLine(
+					`Discarded session ${result.sessionId}: the conversation changed while it was being created.`,
+				);
+				return undefined;
+			}
+			this._sessionId = result.sessionId;
+			this._lastActiveSessionId = result.sessionId;
+			this.onSessionArtifacts?.(result._meta);
+
+			// Parse modes and configOptions
+			if (result.modes) {
+				this.currentMode = result.modes.currentModeId;
+				this.availableModes = result.modes.availableModes.map((m: any) => m.id);
+			}
+
+			if (result.configOptions) {
+				this._parseConfigOptions(result.configOptions);
+			}
+
+			// Force initial preferences if they differ
+			if (this.currentMode && this.currentMode !== initialMode && this.availableModes.includes(initialMode)) {
+				await this.setSessionMode(initialMode, false);
+			}
+			if (initialModel && this.currentModel && this.currentModel !== initialModel && this.availableModels.includes(initialModel)) {
+				await this._applyModelSetting(initialModel);
+			}
+
+			this.notifyStateSync();
+
+			return this._sessionId;
+		} catch (error) {
+			this.outputChannel.appendLine(`Failed to create session: ${error}`);
+			return undefined;
+		}
+	}
+
+	notifyStateSync() {
+		if (this.onStateSync) {
+			this.onStateSync({
+				mode: this.currentMode,
+				availableModes: this.availableModes,
+				model: this.currentModel,
+				availableModels: this.availableModels,
+				provider: this.currentProvider,
+				availableProviders: this.availableProviders
+			});
+		}
+	}
+
+	async setSessionMode(modeId: string, persist = true): Promise<void> {
+		if (!this.connection || !this._sessionId) return;
+		try {
+			await this.connection.setSessionMode({
+				sessionId: this._sessionId,
+				modeId
+			});
+			this.currentMode = modeId;
+			this.notifyStateSync();
+
+			if (persist) {
+				const config = vscode.workspace.getConfiguration('nanocoder');
+				// User setting scope
+				await config.update('mode', modeId, vscode.ConfigurationTarget.Global);
+			}
+		} catch (error) {
+			this.outputChannel.appendLine(`Failed to set mode: ${error}`);
+		}
+	}
+
+	async setSessionProvider(providerId: string, persist = true,): Promise<ConfigSwitchResult> {
+		if (!this.connection) return {ok: false, error: NOT_CONNECTED};
+		if (!this._sessionId) return {ok: false, error: NO_SESSION};
+		try {
+			const result = await this.connection.setSessionConfigOption({
+				sessionId: this._sessionId,
+				configId: 'provider',
+				value: providerId
+			});
+			// Parse the response — server returns updated model list for the new provider
+			if (result?.configOptions) {
+				this._parseConfigOptions(result.configOptions);
+			} else {
+				// Fallback: at minimum update the current provider
+				this.currentProvider = providerId;
+			}
+			this.notifyStateSync();
+			return {ok: true};
+		} catch (error) {
+			this.outputChannel.appendLine(`Failed to set provider: ${error}`);
+			return {ok: false, error: errorText(error)};
+		}
+	}
+
+	async setSessionModel(modelId: string, persist = true,): Promise<ConfigSwitchResult> {
+		if (!this.connection) return {ok: false, error: NOT_CONNECTED};
+		if (!this._sessionId) return {ok: false, error: NO_SESSION};
+		try {
+			const result = await this.connection.setSessionConfigOption({
+				sessionId: this._sessionId,
+				configId: 'model',
+				value: modelId
+			});
+			// Parse the response to get the authoritative current model back from server
+			if (result?.configOptions) {
+				this._parseConfigOptions(result.configOptions);
+			} else {
+				this.currentModel = modelId;
+			}
+			this.notifyStateSync();
+		} catch (error) {
+			this.outputChannel.appendLine(`Failed to set model: ${error}`);
+			return {ok: false, error: errorText(error)};
+		}
+
+		// The session already switched; a failed save only loses the default
+		// for new sessions, so it is reported apart from the switch itself.
+		if (persist) {
+			try {
+				const config = vscode.workspace.getConfiguration('nanocoder');
+				await config.update('model', modelId, vscode.ConfigurationTarget.Global);
+			} catch (error) {
+				this.outputChannel.appendLine(`Failed to save model setting: ${error}`);
+				return {ok: true, persistError: errorText(error)};
+			}
+		}
+		return {ok: true};
+	}
+
+	/**
+	 * Apply the `nanocoder.model` setting to the session. Switches from the
+	 * model dropdown report their own result; this covers the setting itself.
+	 */
+	private async _applyModelSetting(modelId: string): Promise<void> {
+		const result = await this.setSessionModel(modelId, false);
+		if (!result.ok) {
+			vscode.window.showWarningMessage(
+				`Nanocoder: Could not switch to model ${modelId} from your settings: ${result.error}`,
+			);
+		}
+	}
+
+	/** Start a new conversation by clearing the cached session ID. */
+	newChat(): void {
+		// Abandoning the conversation abandons its approval prompts too.
+		this._clearPendingPermissions();
+		const previousSessionId = this._sessionId;
+		this._sessionId = undefined;
+		this._lastActiveSessionId = undefined;
+		// Let the agent cancel the old session's work and free its resources
+		// (timeline lock, in-memory history). Fire-and-forget: New Chat must
+		// not wait on the agent, and a failure only leaves the session open.
+		if (previousSessionId && this.connection && this._supportsSessionClose) {
+			this.connection
+				.closeSession({sessionId: previousSessionId})
+				.catch(error => {
+					this.outputChannel.appendLine(
+						`Failed to close session ${previousSessionId}: ${error}`,
+					);
+				});
+		}
+		// ...and a session still being created for it.
+		this._abandonPendingSession();
+		this.onSessionArtifacts?.(undefined);
+	}
+	/**
+	 * Send a prompt and return the agent's PromptResponse (carries the
+	 * experimental per-turn `usage` field plus `_meta` extensions such as
+	 * the estimated cost). Returns undefined on failure.
+	 */
+	async prompt(text: string, images?: { data: string, mimeType: string }[]): Promise<import('@agentclientprotocol/sdk').PromptResponse | undefined> {
+		if (!this.connection || !this._sessionId) return undefined;
+		const attempt = new PromptAttempt();
+		this.activePrompt = attempt;
+		try {
+			const promptData: import('@agentclientprotocol/sdk').ContentBlock[] = [{ type: 'text', text }];
+			if (images && images.length > 0) {
+				for (const img of images) {
+					promptData.push({ type: 'image', data: img.data, mimeType: img.mimeType });
+				}
+			}
+			return await this.connection.prompt({
+				sessionId: this._sessionId,
+				prompt: promptData
+			});
+		} catch (error) {
+			if (attempt.cancelRequested) {
+				this.outputChannel.appendLine('Prompt cancelled by user.');
+				return {stopReason: 'cancelled'};
+			} else {
+				this.outputChannel.appendLine(`Prompt failed: ${error}`);
+				vscode.window.showErrorMessage(`Nanocoder prompt failed: ${error}`);
+			}
+			return undefined;
+		} finally {
+			if (this.activePrompt === attempt) {
+				this.activePrompt = undefined;
+			}
+		}
+	}
+
+	async cancel(): Promise<void> {
+		this.activePrompt?.cancel();
+		// Before the notification, so the map is emptied even if cancel() throws.
+		this._clearPendingPermissions();
+		if (!this.connection || !this._sessionId) return;
+		try {
+			await this.connection.cancel({
+				sessionId: this._sessionId
+			});
+		} catch (error) {
+			this.outputChannel.appendLine(`Cancel failed: ${error}`);
+		}
+	}
+
+	/** Parse configOptions array from any ACP response and update local state. */
+	private _parseConfigOptions(configOptions: any[]): void {
+		const modelOpt = configOptions.find((o: any) => o.id === 'model') as any;
+		if (modelOpt) {
+			this.currentModel = modelOpt.currentValue;
+			this.availableModels = [];
+			for (const opt of modelOpt.options || []) {
+				if (opt.options && Array.isArray(opt.options)) {
+					// Grouped options (e.g. provider > models)
+					this.availableModels.push(...opt.options.map((o: any) => o.value || o));
+				} else {
+					// Flat option
+					this.availableModels.push(opt.value || opt);
+				}
+			}
+		}
+		const providerOpt = configOptions.find((o: any) => o.id === 'provider') as any;
+		if (providerOpt) {
+			this.currentProvider = providerOpt.currentValue;
+			this.availableProviders = providerOpt.options
+				? providerOpt.options.map((o: any) => o.value || o)
+				: [];
+		}
+	}
+
+	private isVersionIncompatible(serverVersion: string): boolean {
+		const parseVersion = (v: string) => v.split('.').map(n => parseInt(n, 10) || 0);
+		const [sMajor, sMinor, sPatch] = parseVersion(serverVersion);
+		const [rMajor, rMinor, rPatch] = parseVersion(MINIMUM_CLI_VERSION);
+
+		if (sMajor < rMajor) return true;
+		if (sMajor === rMajor && sMinor < rMinor) return true;
+		if (sMajor === rMajor && sMinor === rMinor && sPatch < rPatch) return true;
+		
+		return false; 
+	}
+
+	async listSessions(): Promise<Array<{sessionId: string; cwd: string; title?: string | null; updatedAt?: string | null}>> {
+		if (!this.connection) return [];
+		try {
+			const result = await this.connection.listSessions({});
+			return result.sessions.map((s: any) => ({
+				sessionId: s.sessionId,
+				cwd: s.cwd,
+				title: s.title,
+				updatedAt: s.updatedAt,
+			}));
+		} catch (error) {
+			this.outputChannel.appendLine(`listSessions failed: ${error}`);
+			return [];
+		}
+	}
+
+	/**
+	 * The advertised name when the agent lists it, else the bare name an agent
+	 * from before the `_nanocoder/` prefix understands.
+	 */
+	private extMethodName(method: (typeof ACP_EXT_METHODS)[number]): string {
+		const advertised = `${ACP_EXT_PREFIX}${method}`;
+		return this._extMethods.includes(advertised) ? advertised : method;
+	}
+
+	async renameSession(sessionId: string, title: string): Promise<void> {
+		if (!this.connection) return;
+		try {
+			await this.connection.extMethod(
+				this.extMethodName('renameSession'),
+				{sessionId, title},
+			);
+		} catch (error) {
+			this.outputChannel.appendLine(`renameSession failed: ${error}`);
+			vscode.window.showErrorMessage(`Failed to rename session: ${error}`);
+		}
+	}
+
+	async deleteSession(sessionId: string): Promise<void> {
+		if (!this.connection) return;
+		try {
+			await this.connection.deleteSession({sessionId});
+			if (this._lastActiveSessionId === sessionId) {
+				this._lastActiveSessionId = undefined;
+			}
+		} catch (error) {
+			this.outputChannel.appendLine(`deleteSession failed: ${error}`);
+			vscode.window.showErrorMessage(`Failed to delete session: ${error}`);
+		}
+	}
+
+	async resumeSession(sessionId: string, options?: { silent?: boolean }): Promise<boolean> {
+		if (!this.connection) return false;
+		try {
+			const cwd = resolveExtensionCwd();
+			const result = await this.connection.resumeSession({sessionId, cwd});
+			// A session still being created must not land on top of this one.
+			this._abandonPendingSession();
+			this._sessionId = sessionId;
+			this._lastActiveSessionId = sessionId;
+			if (result.modes) {
+				this.currentMode = result.modes.currentModeId;
+				this.availableModes = result.modes.availableModes.map((mode: any) => mode.id);
+			}
+			if (result.configOptions) {
+				this._parseConfigOptions(result.configOptions);
+			}
+			this.onSessionArtifacts?.(result._meta);
+			this.notifyStateSync();
+			return true;
+		} catch (error) {
+			this.outputChannel.appendLine(`resumeSession failed: ${error}`);
+			if (!options?.silent) {
+				vscode.window.showErrorMessage(`Failed to resume session: ${error}`);
+			}
+			return false;
+		}
+	}
+
+	/**
+	 * Erases the retried turn from session history before resending the prompt,
+	 * preventing duplicate user bubbles and stale assistant responses in history.
+	 */
+	async retryTurn(promptText?: string): Promise<void> {
+		if (!this.connection || !this._sessionId) {
+			return;
+		}
+		try {
+			await this.connection.extMethod(
+				this.extMethodName('retryTurn'),
+				{
+					sessionId: this._sessionId,
+					promptText,
+				},
+			);
+		} catch (error) {
+			this.outputChannel.appendLine(`retryTurn warning: ${error}`);
+		}
+	}
+
+}

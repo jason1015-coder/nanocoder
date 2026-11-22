@@ -1,5 +1,20 @@
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
+import {join} from 'node:path';
 import test from 'ava';
-import {clearAppConfig, getAppConfig} from '@/config/index.js';
+import {dropOrphanedToolResults} from '@/ai-sdk-client/converters/message-converter.js';
+import {
+	clearAppConfig,
+	getAppConfig,
+	reloadAppConfig,
+} from '@/config/index.js';
+import {loadPlugins, resetPluginsForTests} from '@/plugins/host.js';
+import {resetSessionCwd, setProjectRoot, setSessionCwd} from '@/services/session-cwd.js';
+import {setToolRegistryGetter} from '@/message-handler.js';
+import {fileOpTool} from '@/tools/file-ops/file-op.js';
+import '@/tools/file-ops/write-file';
+import {ToolRegistry} from '@/tools/tool-registry.js';
+import type {HooksConfig} from '@/types/config';
 import {resetShutdownManager} from '@/utils/shutdown/shutdown-manager.js';
 import {processAssistantResponse, resetFallbackNotice, resetLastTurnHadReasoning} from './conversation-loop.js';
 import type {
@@ -9,17 +24,19 @@ import type {
 	ToolCall,
 	ToolResult,
 } from '@/types/core';
+import type {RetryLimitsConfig} from '@/types/index';
 import {
 	resetAutoCompactSession,
 	setAutoCompactEnabled,
 	setAutoCompactStrategy,
 	setAutoCompactThreshold,
-} from '@/utils/auto-compact.js';
+} from '@/conversation/compaction/auto-compact.js';
 import {
 	resetSessionContextLimit,
 	setSessionContextLimit,
 } from '@/models/models-dev-client.js';
-import {setGlobalToolConfirmHandler} from '@/utils/tool-confirm-queue.js';
+import {setGlobalQuestionHandler} from '@/tools/runtime/question-queue.js';
+import {setGlobalToolConfirmHandler} from '@/tools/runtime/tool-confirm-queue.js';
 
 // The ShutdownManager singleton is created as a side effect of transitive
 // imports (via @/utils/logging). Its uncaughtException/unhandledRejection
@@ -103,6 +120,163 @@ const createMockToolManager = (config: {
 	isReadOnly: () => false,
 });
 
+for (const scenario of [
+	{label: 'denied', approved: false, mode: 'auto-accept', nonInteractive: false, expected: 'first file', prompts: 1},
+	{label: 'approved', approved: true, mode: 'auto-accept', nonInteractive: false, expected: 'second file', prompts: 1},
+	{label: 'non-interactive', approved: false, mode: 'auto-accept', nonInteractive: true, expected: 'first file', prompts: 0},
+	{label: 'yolo', approved: false, mode: 'yolo', nonInteractive: false, expected: 'second file', prompts: 0},
+	{label: 'headless', approved: false, mode: 'headless', nonInteractive: false, expected: 'second file', prompts: 0},
+	{label: 'architect', approved: false, mode: 'architect', nonInteractive: false, expected: 'second file', prompts: 0},
+	{label: 'alwaysAllow', approved: false, mode: 'auto-accept', nonInteractive: false, expected: 'second file', prompts: 0},
+] as const) {
+	test.serial(`batched file_op overwrite is ${scenario.label} at execution time`, async t => {
+		const cwd = mkdtempSync(join(tmpdir(), 'file-op-batch-'));
+		const configDir = process.env.NANOCODER_CONFIG_DIR;
+		process.env.NANOCODER_CONFIG_DIR = cwd;
+		writeFileSync(join(cwd, 'agents.config.json'), JSON.stringify({nanocoder: {
+			alwaysAllow: scenario.label === 'alwaysAllow' ? ['file_op'] : [],
+		}}));
+		setProjectRoot(cwd);
+		setSessionCwd(cwd);
+		reloadAppConfig();
+		writeFileSync(join(cwd, 'first.txt'), 'first file');
+		writeFileSync(join(cwd, 'second.txt'), 'second file');
+		const registry = ToolRegistry.fromToolExports([fileOpTool]);
+		setToolRegistryGetter(() => registry.getHandlers());
+		let prompts = 0;
+		setGlobalToolConfirmHandler(async () => {
+			prompts++;
+			return scenario.approved;
+		});
+		let calls = 0;
+		const client = {chat: async () => {
+			calls++;
+			return {choices: [{message: calls === 1 ? {
+				role: 'assistant', content: '', tool_calls: ['first.txt', 'second.txt'].map((path, index) => ({
+					id: `copy-${index}`, function: {name: 'file_op', arguments: JSON.stringify({operation: 'copy', path, destination: 'target.txt'})},
+				})),
+			} : {role: 'assistant', content: 'done'}}]};
+		}};
+		try {
+			await processAssistantResponse(createDefaultParams({
+				client,
+				toolManager: {
+					...createMockToolManager({tools: ['file_op']}),
+					getToolEntry: (name: string) => registry.getEntry(name),
+					getToolFormatter: () => undefined,
+				},
+				developmentMode: scenario.mode,
+				nonInteractiveMode: scenario.nonInteractive,
+			}) as never);
+			t.is(prompts, scenario.prompts);
+			t.is(readFileSync(join(cwd, 'target.txt'), 'utf8'), scenario.expected);
+		} finally {
+			if (configDir === undefined) delete process.env.NANOCODER_CONFIG_DIR;
+			else process.env.NANOCODER_CONFIG_DIR = configDir;
+			clearAppConfig();
+			setGlobalToolConfirmHandler(async () => true);
+			resetSessionCwd();
+			rmSync(cwd, {recursive: true, force: true});
+		}
+	});
+}
+
+// Shift+Tab can switch to plan mode at any point in a turn. The tool list the
+// model was offered is a snapshot, so a call it already made must be checked
+// against the mode as it is now, even when alwaysAllow would skip the prompt.
+const runMidTurnSwitch = async (
+	flipAt: 'response' | 'executed' | 'prompt',
+	mode: 'yolo' | 'auto-accept',
+	operations: Array<{operation: 'copy' | 'delete'; path: string; destination?: string}>,
+) => {
+	const cwd = mkdtempSync(join(tmpdir(), 'mode-switch-'));
+	const configDir = process.env.NANOCODER_CONFIG_DIR;
+	process.env.NANOCODER_CONFIG_DIR = cwd;
+	writeFileSync(join(cwd, 'agents.config.json'), JSON.stringify({nanocoder: {
+		alwaysAllow: mode === 'yolo' ? ['file_op'] : [],
+	}}));
+	setProjectRoot(cwd);
+	setSessionCwd(cwd);
+	reloadAppConfig();
+	writeFileSync(join(cwd, 'first.txt'), 'first file');
+	writeFileSync(join(cwd, 'second.txt'), 'second file');
+	const registry = ToolRegistry.fromToolExports([fileOpTool]);
+	setToolRegistryGetter(() => registry.getHandlers());
+	let prompts = 0;
+	setGlobalToolConfirmHandler(async () => {
+		prompts++;
+		return true;
+	});
+	const modeRef = {current: mode as string};
+	let calls = 0;
+	const client = {chat: async () => {
+		calls++;
+		if (calls === 1 && flipAt === 'response') modeRef.current = 'plan';
+		return {choices: [{message: calls === 1 ? {
+			role: 'assistant', content: '', tool_calls: operations.map((args, index) => ({
+				id: `op-${index}`, function: {name: 'file_op', arguments: JSON.stringify(args)},
+			})),
+		} : {role: 'assistant', content: 'done'}}]};
+	}};
+	try {
+		await processAssistantResponse(createDefaultParams({
+			client,
+			toolManager: {
+				...createMockToolManager({tools: ['file_op']}),
+				getAvailableToolNames: (_tune: unknown, current: string) =>
+					current === 'plan' ? ['read_file'] : ['file_op'],
+				getToolEntry: (name: string) => registry.getEntry(name),
+				getToolFormatter: () => undefined,
+			},
+			developmentMode: mode,
+			developmentModeRef: modeRef,
+			setIsGenerating: (generating: boolean) => {
+				if (flipAt === 'prompt' && !generating) modeRef.current = 'plan';
+			},
+			conversationStateManager: {current: {
+				updateAssistantMessage: () => {},
+				updateAfterToolExecution: () => {
+					if (flipAt === 'executed') modeRef.current = 'plan';
+				},
+			}},
+		}) as never);
+		return {cwd, prompts, exists: (name: string) => existsSync(join(cwd, name))};
+	} finally {
+		if (configDir === undefined) delete process.env.NANOCODER_CONFIG_DIR;
+		else process.env.NANOCODER_CONFIG_DIR = configDir;
+		clearAppConfig();
+		setGlobalToolConfirmHandler(async () => true);
+		resetSessionCwd();
+	}
+};
+
+test.serial('a switch to plan while the model answers refuses a call alwaysAllow would skip the prompt for', async t => {
+	const run = await runMidTurnSwitch('response', 'yolo', [
+		{operation: 'copy', path: 'first.txt', destination: 'target.txt'},
+	]);
+	t.false(run.exists('target.txt'));
+	rmSync(run.cwd, {recursive: true, force: true});
+});
+
+test.serial('a switch to plan between two tools of a batch stops the second one', async t => {
+	const run = await runMidTurnSwitch('executed', 'yolo', [
+		{operation: 'copy', path: 'first.txt', destination: 'one.txt'},
+		{operation: 'copy', path: 'second.txt', destination: 'two.txt'},
+	]);
+	t.true(run.exists('one.txt'), 'the call before the switch ran');
+	t.false(run.exists('two.txt'), 'the call after the switch did not');
+	rmSync(run.cwd, {recursive: true, force: true});
+});
+
+test.serial('a switch to plan before a confirmation prompt means the tool is not asked about', async t => {
+	const run = await runMidTurnSwitch('prompt', 'auto-accept', [
+		{operation: 'delete', path: 'first.txt'},
+	]);
+	t.is(run.prompts, 0);
+	t.true(run.exists('first.txt'));
+	rmSync(run.cwd, {recursive: true, force: true});
+});
+
 // Mock parseToolCalls function - imported from tool-parsing
 const mockParseToolCalls = (result: {
 	success: boolean;
@@ -146,96 +320,466 @@ const createDefaultParams = (overrides = {}) => ({
 	...overrides,
 });
 
+// A client that answers each request with the next scripted reply and keeps
+// the history it was sent, so a test can assert what the model saw.
+const scriptedClient = (
+	replies: Array<{
+		content?: string;
+		toolCalls?: ToolCall[];
+		toolsDisabled?: boolean;
+	}>,
+) => {
+	const requests: Message[][] = [];
+	return {
+		requests,
+		client: {
+			chat: async (messages: Message[]): Promise<LLMChatResponse> => {
+				requests.push(messages);
+				const reply = replies[requests.length - 1] ?? {content: 'done'};
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: reply.content ?? '',
+								tool_calls: reply.toolCalls,
+							},
+						},
+					],
+					toolsDisabled: reply.toolsDisabled ?? false,
+				};
+			},
+		},
+	};
+};
+
+const toolCall = (name: string, id = `call_${name}`): ToolCall => ({
+	id,
+	function: {name, arguments: '{}'},
+});
+
+// The `message` prop of every chat-queue item, for asserting what the user saw.
+const queuedMessages = (queue: unknown[]) =>
+	queue.map(item => String((item as {props?: {message?: unknown}})?.props?.message ?? ''));
+
 // ============================================================================
-// Malformed Tool Recovery Tests (lines 127-169)
+// Malformed Tool Recovery Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - handles malformed tool call recovery', async t => {
-	// This test simulates the parseToolCalls returning success: false
-	// The function should display an error and recurse with corrected messages
+	// '[tool_use: name]' is a shape the text parser rejects as malformed.
+	const {client, requests} = scriptedClient([
+		{content: '[tool_use: read_file]', toolsDisabled: true},
+		{content: 'Recovered answer'},
+	]);
+	const queue: unknown[] = [];
+	let completions = 0;
+	await processAssistantResponse(
+		createDefaultParams({
+			client,
+			toolManager: createMockToolManager({tools: ['read_file']}),
+			addToChatQueue: (item: unknown) => queue.push(item),
+			onConversationComplete: () => {
+				completions++;
+			},
+		}),
+	);
 
-	// Note: Since parseToolCalls is an internal import, we can't easily mock it
-	// This test documents the expected behavior but would require refactoring
-	// to make parseToolCalls injectable for proper testing
-
-	t.pass('Malformed tool recovery requires injectable parseToolCalls');
+	t.is(requests.length, 2, 'the malformed turn is retried once');
+	const [assistant, nudge] = requests[1].slice(-2);
+	t.deepEqual(assistant, {role: 'assistant', content: '[tool_use: read_file]'});
+	t.is(nudge.role, 'user');
+	t.regex(String(nudge.content), /malformed tool call/);
+	t.true(
+		queuedMessages(queue).some(
+			message => message.length > 0 && String(nudge.content).includes(message),
+		),
+		'the parse error the model is sent is also shown to the user',
+	);
+	t.is(completions, 1);
 });
 
 // ============================================================================
-// Unknown Tool Handling Tests (lines 236-261)
+// Unknown Tool Handling Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - handles unknown tool errors', async t => {
-	// This requires mocking filterValidToolCalls to return error results
-	// The function should display errors and recurse with error context
+	let ran = false;
+	setToolRegistryGetter(() => ({
+		nope: async () => {
+			ran = true;
+			return 'should not run';
+		},
+	}));
+	const {client, requests} = scriptedClient([
+		{toolCalls: [toolCall('nope')]},
+		{content: 'Sorry, done.'},
+	]);
+	const queue: unknown[] = [];
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client,
+				toolManager: createMockToolManager({tools: ['read_file']}),
+				addToChatQueue: (item: unknown) => queue.push(item),
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+	}
 
-	t.pass('Unknown tool handling requires injectable filterValidToolCalls');
+	t.false(ran, 'an unknown tool never runs');
+	t.is(requests.length, 2, 'the model is asked to retry with a valid tool');
+	const result = requests[1][requests[1].length - 1];
+	t.is(result.role, 'tool');
+	t.is(result.tool_call_id, 'call_nope');
+	t.regex(String(result.content), /nope/);
+	t.true(
+		queuedMessages(queue).some(message => message.includes('unavailable tool ("nope")')),
+		'the user sees a concise notice',
+	);
 });
 
 // ============================================================================
-// Plan Mode Blocking Tests (lines 265-310)
+// Plan Mode Blocking Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - blocks file modification tools in plan mode', async t => {
-	// This test would require:
-	// 1. Mock client.chat() to return file modification tool calls
-	// 2. Set developmentMode to 'plan'
-	// 3. Verify error messages are displayed
-	// 4. Verify recursion with error results
+	let wrote = false;
+	setToolRegistryGetter(() => ({
+		write_file: async () => {
+			wrote = true;
+			return 'written';
+		},
+	}));
+	const {client, requests} = scriptedClient([
+		{toolCalls: [toolCall('write_file')]},
+		{content: 'Here is the plan instead.'},
+	]);
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client,
+				toolManager: {
+					...createMockToolManager({
+						tools: ['read_file', 'write_file'],
+						needsApproval: false,
+					}),
+					// Plan mode does not offer write_file, though it is registered.
+					getAvailableToolNames: () => ['read_file'],
+				},
+				developmentMode: 'plan' as const,
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+	}
 
-	t.pass('Plan mode blocking requires injectable dependencies');
+	t.false(wrote, 'a mutating tool plan mode did not offer never runs');
+	const result = requests[1][requests[1].length - 1];
+	t.is(result.role, 'tool');
+	t.regex(String(result.content), /not available in the current mode/);
 });
 
 // ============================================================================
-// Tool Categorization Tests (lines 314-391)
+// Tool Categorization Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - categorizes tools by needsApproval', async t => {
-	// This test requires:
-	// 1. Mock client.chat() to return multiple tool calls
-	// 2. Mock toolManager.getToolEntry() to return different needsApproval values
-	// 3. Verify tools are correctly separated into confirmation vs direct execution
+	const ran: string[] = [];
+	setToolRegistryGetter(() => ({
+		auto_tool: async () => {
+			ran.push('auto_tool');
+			return 'auto done';
+		},
+		guarded_tool: async () => {
+			ran.push('guarded_tool');
+			return 'guarded done';
+		},
+	}));
+	const prompted: string[] = [];
+	setGlobalToolConfirmHandler(async (request: {toolCall: ToolCall}) => {
+		prompted.push(request.toolCall.function.name);
+		return true;
+	});
+	const {client} = scriptedClient([
+		{toolCalls: [toolCall('auto_tool'), toolCall('guarded_tool')]},
+		{content: 'Both done.'},
+	]);
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client,
+				toolManager: {
+					...createMockToolManager({tools: ['auto_tool', 'guarded_tool']}),
+					getToolFormatter: () => undefined,
+					getToolEntry: (name: string) => ({
+						name,
+						approval: name === 'guarded_tool',
+					}),
+				},
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+		setGlobalToolConfirmHandler(async () => true);
+	}
 
-	t.pass('Tool categorization requires injectable toolManager');
+	t.deepEqual(prompted, ['guarded_tool'], 'only the tool needing approval asks');
+	t.deepEqual(ran, ['auto_tool', 'guarded_tool']);
 });
 
 // ============================================================================
-// Direct Execution Tests (lines 394-418)
+// Direct Execution Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - executes tools directly when no approval needed', async t => {
-	// This test requires:
-	// 1. Mock client.chat() to return tool calls with needsApproval: false
-	// 2. Mock executeToolsDirectly to return results
-	// 3. Verify recursion with tool results
+	let ran = 0;
+	setToolRegistryGetter(() => ({
+		safe_tool: async () => {
+			ran++;
+			return 'safe output';
+		},
+	}));
+	let prompts = 0;
+	setGlobalToolConfirmHandler(async () => {
+		prompts++;
+		return true;
+	});
+	const {client, requests} = scriptedClient([
+		{toolCalls: [toolCall('safe_tool')]},
+		{content: 'All done.'},
+	]);
+	let completions = 0;
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client,
+				toolManager: {
+					...createMockToolManager({
+						tools: ['safe_tool'],
+						needsApproval: false,
+					}),
+					getToolFormatter: () => undefined,
+				},
+				onConversationComplete: () => {
+					completions++;
+				},
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+		setGlobalToolConfirmHandler(async () => true);
+	}
 
-	t.pass('Direct execution requires injectable executeToolsDirectly');
+	t.is(ran, 1);
+	t.is(prompts, 0, 'no confirmation for a tool that needs none');
+	const result = requests[1][requests[1].length - 1];
+	t.is(result.role, 'tool');
+	t.is(result.tool_call_id, 'call_safe_tool');
+	t.regex(String(result.content), /safe output/);
+	t.is(completions, 1);
 });
 
 // ============================================================================
-// Non-Interactive Exit Tests (lines 422-453)
+// Non-Interactive Exit Tests
 // ============================================================================
 
 test.serial('processAssistantResponse - exits in non-interactive mode when approval needed', async t => {
-	let conversationCompleteCalled = false;
-	const addToChatQueue = () => {};
-	const setMessages = () => {};
+	let ran = false;
+	setToolRegistryGetter(() => ({
+		guarded_tool: async () => {
+			ran = true;
+			return 'should not run';
+		},
+	}));
+	let prompts = 0;
+	setGlobalToolConfirmHandler(async () => {
+		prompts++;
+		return true;
+	});
+	const {client, requests} = scriptedClient([
+		{toolCalls: [toolCall('guarded_tool')]},
+	]);
+	const snapshots: Message[][] = [];
+	const generating: boolean[] = [];
+	let completions = 0;
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client,
+				toolManager: createMockToolManager({
+					tools: ['guarded_tool'],
+					needsApproval: true,
+				}),
+				nonInteractiveMode: true,
+				setMessages: (messages: Message[]) => snapshots.push(messages),
+				setIsGenerating: (value: boolean) => generating.push(value),
+				onConversationComplete: () => {
+					completions++;
+				},
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+		setGlobalToolConfirmHandler(async () => true);
+	}
+
+	t.false(ran);
+	t.is(prompts, 0, 'nobody is asked in a non-interactive run');
+	t.is(requests.length, 1, 'the run exits instead of re-prompting');
+	t.is(completions, 1);
+	t.is(generating[generating.length - 1], false);
+	const final = snapshots[snapshots.length - 1];
+	const result = final.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_guarded_tool',
+	);
+	t.truthy(result, 'the blocked call still gets a result');
+	t.regex(String(final[final.length - 1].content), /^Tool approval required for: guarded_tool/);
+});
+
+test.serial('processAssistantResponse - marks the non-interactive approval notice display-only', async t => {
+	const captured: Message[][] = [];
 
 	const params = createDefaultParams({
-		developmentMode: 'normal',
+		client: createMockClient({
+			toolCalls: [{id: 'call_1', function: {name: 'some_tool', arguments: {}}}],
+		}),
+		toolManager: createMockToolManager({
+			tools: ['some_tool'],
+			needsApproval: true,
+		}),
 		nonInteractiveMode: true,
-		onConversationComplete: () => {
-			conversationCompleteCalled = true;
-		},
-		addToChatQueue,
-		setMessages,
+		setMessages: (msgs: Message[]) => captured.push(msgs),
 	});
 
-	// Create a mock client that returns a tool requiring approval
-	// (We can't easily test this without injectable dependencies)
+	await processAssistantResponse(params);
 
-	t.pass('Non-interactive exit requires proper mock setup');
+	const latest = captured[captured.length - 1];
+	const notice = latest[latest.length - 1];
+	t.is(notice.role, 'assistant');
+	t.regex(notice.content, /Tool approval required for: some_tool/);
+	t.true(notice.displayOnly, 'the approval notice must never reach the model');
 });
+
+const PERMISSION_PLUGIN = `export default {
+	apiVersion: 1,
+	name: 'guard',
+	hooks: {
+		'permission.asked': ({toolArgs}) =>
+			String(toolArgs.command).includes('--force')
+				? {decision: 'deny', reason: 'no force push'}
+				: {decision: 'defer'},
+	},
+};
+`;
+
+async function withPermissionPlugin(
+	run: () => Promise<void>,
+): Promise<void> {
+	const root = join(tmpdir(), `nanocoder-loop-plugins-${Date.now()}`);
+	mkdirSync(join(root, '.nanocoder', 'plugins'), {recursive: true});
+	writeFileSync(
+		join(root, '.nanocoder', 'plugins', 'guard.mjs'),
+		PERMISSION_PLUGIN,
+		'utf-8',
+	);
+	setProjectRoot(root);
+	resetPluginsForTests();
+	await loadPlugins(true);
+	try {
+		await run();
+	} finally {
+		resetPluginsForTests();
+		resetSessionCwd();
+	}
+}
+
+test.serial(
+	'processAssistantResponse - a plugin deny refuses the tool before the approval prompt',
+	async t => {
+		let asked = false;
+		const restore = setGlobalToolConfirmHandler(async () => {
+			asked = true;
+			return true;
+		});
+		const shown: string[] = [];
+		try {
+			await withPermissionPlugin(async () => {
+				await processAssistantResponse(
+					createDefaultParams({
+						client: createMockClient({
+							toolCalls: [
+								{
+									id: 'call_force',
+									function: {
+										name: 'execute_bash',
+										arguments: {command: 'git push --force'},
+									},
+								},
+							],
+						}),
+						toolManager: createMockToolManager({
+							tools: ['execute_bash'],
+							needsApproval: true,
+						}),
+						addToChatQueue: (node: {props?: {message?: string}}) => {
+							if (node?.props?.message) shown.push(node.props.message);
+						},
+					}),
+				);
+			});
+		} finally {
+			restore();
+		}
+
+		t.false(asked);
+		t.true(shown.includes('no force push'));
+	},
+);
+
+test.serial(
+	'processAssistantResponse - a plugin defer still asks for approval',
+	async t => {
+		let asked = false;
+		const restore = setGlobalToolConfirmHandler(async () => {
+			asked = true;
+			return false;
+		});
+		const shown: string[] = [];
+		try {
+			await withPermissionPlugin(async () => {
+				await processAssistantResponse(
+					createDefaultParams({
+						client: createMockClient({
+							toolCalls: [
+								{
+									id: 'call_status',
+									function: {
+										name: 'execute_bash',
+										arguments: {command: 'git status'},
+									},
+								},
+							],
+						}),
+						toolManager: createMockToolManager({
+							tools: ['execute_bash'],
+							needsApproval: true,
+						}),
+						addToChatQueue: (node: {props?: {message?: string}}) => {
+							if (node?.props?.message) shown.push(node.props.message);
+						},
+					}),
+				);
+			});
+		} finally {
+			restore();
+		}
+
+		t.true(asked);
+		t.false(shown.includes('no force push'));
+	},
+);
 
 // ============================================================================
 // Auto-Nudge Tests (lines 469-506)
@@ -1079,6 +1623,43 @@ test.serial('processAssistantResponse - compact-and-retry adds nudge message to 
 	}
 });
 
+test.serial('processAssistantResponse - compact-and-retry invalidates read_file stubs', async t => {
+	const {clearReadTracker, matchReadContent, rememberReadContent} = await import(
+		'@/tools/runtime/read-tracker.js'
+	);
+	clearReadTracker();
+	const stats = {mtimeMs: 1, size: 10};
+	rememberReadContent('/tmp/compact-retry/app.ts', stats, 3);
+
+	const messagesSetCalls: Message[][] = [];
+	const longContent = 'Verbose conversation content that exceeds thresholds for mechanical compression. '.repeat(30);
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => ({
+				choices: [{message: {role: 'assistant', content: '', tool_calls: undefined}}],
+				toolsDisabled: false,
+			}),
+		},
+		messages: [
+			{role: 'user', content: longContent},
+			{role: 'assistant', content: 'Prior response.'},
+		],
+		setMessages: (msgs: Message[]) => messagesSetCalls.push(msgs),
+		addToChatQueue: () => {},
+	});
+
+	await processAssistantResponse(params);
+
+	t.true(
+		messagesSetCalls.some(msgs =>
+			msgs.some(m => m.role === 'user' && m.content.includes('Context has been compacted')),
+		),
+		'compact-and-retry should have run',
+	);
+	t.is(matchReadContent('/tmp/compact-retry/app.ts', stats), undefined);
+	clearReadTracker();
+});
+
 test.serial('processAssistantResponse - MAX_COMPACT_RETRIES constant limits retry cycles', async t => {
 	// Verify that the total number of chat calls is bounded even when the model
 	// keeps returning empty responses. With MAX_EMPTY_TURNS=2 and MAX_COMPACT_RETRIES=1,
@@ -1167,24 +1748,151 @@ test.serial('processAssistantResponse - compactRetryCount parameter is passed th
 // Conversation Complete Tests (lines 509-510)
 // ============================================================================
 
+test.serial('processAssistantResponse - nudges once for an approved plan without a walkthrough', async t => {
+	let chatCallCount = 0;
+	let nudge = '';
+	let completionCount = 0;
+	const client = {
+		chat: async (messages: Message[]): Promise<LLMChatResponse> => {
+			chatCallCount++;
+			if (chatCallCount === 2) {
+				nudge = messages.at(-1)?.content ?? '';
+			}
+			return {
+				choices: [
+					{
+						message: {
+							role: 'assistant',
+							content:
+								chatCallCount === 1 ? 'Implementation complete.' : 'Confirmed.',
+						},
+					},
+				],
+				toolsDisabled: false,
+			};
+		},
+	};
+
+	await processAssistantResponse(
+		createDefaultParams({
+			client,
+			messages: [
+				{
+					role: 'user',
+					content: '<approved_plan>Implement artifacts.</approved_plan>',
+				},
+			],
+			toolManager: createMockToolManager({tools: ['write_walkthrough']}),
+			onConversationComplete: () => {
+				completionCount++;
+			},
+		}),
+	);
+
+	t.is(chatCallCount, 2);
+	t.true(nudge.includes('write_walkthrough'));
+	t.is(completionCount, 1);
+});
+
 test.serial('processAssistantResponse - calls onConversationComplete when done', async t => {
 	let conversationCompleteCalled = false;
 
+	const generating: boolean[] = [];
+	let chatCalls = 0;
+	const client = createMockClient({
+		content: 'Here is my response!',
+		toolCalls: undefined,
+	});
 	const params = createDefaultParams({
 		onConversationComplete: () => {
 			conversationCompleteCalled = true;
 		},
-		// Mock client to return content with no tool calls
-		client: createMockClient({
-			content: 'Here is my response!',
-			toolCalls: undefined,
-		}),
+		setIsGenerating: (value: boolean) => generating.push(value),
+		client: {
+			chat: async () => {
+				chatCalls++;
+				return client.chat();
+			},
+		},
 	});
 
-	// This would complete the conversation without errors
-	// if all dependencies are properly mocked
+	await processAssistantResponse(params);
 
-	t.pass('Conversation complete requires proper mock setup');
+	t.true(conversationCompleteCalled);
+	t.is(chatCalls, 1);
+	t.is(generating[generating.length - 1], false, 'generation ends');
+});
+
+// #2048: declining a confirmation ends the turn. Every call the decline
+// skipped is paired with a cancellation result, the model is not asked
+// again, and completion is signalled exactly once so queued messages drain.
+test.serial('#2048 a declined confirmation records cancellations and signals completion once', async t => {
+	const ran: string[] = [];
+	setToolRegistryGetter(() => ({
+		first_tool: async () => {
+			ran.push('first_tool');
+			return 'first';
+		},
+		second_tool: async () => {
+			ran.push('second_tool');
+			return 'second';
+		},
+	}));
+	setGlobalToolConfirmHandler(async () => false);
+	const snapshots: Message[][] = [];
+	const queue: unknown[] = [];
+	let completions = 0;
+	let chatCalls = 0;
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client: {
+					chat: async (): Promise<LLMChatResponse> => {
+						chatCalls++;
+						return {
+							choices: [
+								{
+									message: {
+										role: 'assistant',
+										content: '',
+										tool_calls: [
+											{id: 'call_first', function: {name: 'first_tool', arguments: '{}'}},
+											{id: 'call_second', function: {name: 'second_tool', arguments: '{}'}},
+										],
+									},
+								},
+							],
+							toolsDisabled: false,
+						};
+					},
+				},
+				toolManager: createMockToolManager({
+					tools: ['first_tool', 'second_tool'],
+					needsApproval: true,
+				}),
+				setMessages: (messages: Message[]) => snapshots.push(messages),
+				addToChatQueue: (item: unknown) => queue.push(item),
+				onConversationComplete: () => {
+					completions++;
+				},
+			}),
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+		setGlobalToolConfirmHandler(async () => true);
+	}
+
+	t.deepEqual(ran, [], 'nothing declined runs');
+	t.is(chatCalls, 1, 'a decline does not re-prompt the model');
+	t.is(completions, 1);
+	const final = snapshots[snapshots.length - 1];
+	for (const id of ['call_first', 'call_second']) {
+		const result = final.find(m => m.role === 'tool' && m.tool_call_id === id);
+		t.regex(String(result?.content), /cancelled/i, `${id} is paired with a cancellation`);
+	}
+	t.true(
+		queuedMessages(queue).includes('Tool execution cancelled by user.'),
+	);
 });
 
 // ============================================================================
@@ -1430,6 +2138,15 @@ function setupAutoCompactTestEnv() {
 	setAutoCompactThreshold(50);
 	resetSessionContextLimit();
 	clearAppConfig();
+	// Pin the agent-loop retry limits to their shipped defaults. Many tests here
+	// count exact chat calls, and a `nanocoder.retries` block in the developer's
+	// project or personal config would otherwise change those counts.
+	const retries = getAppConfig().retries;
+	if (retries) {
+		retries.maxRepeatedToolCalls = 3;
+		retries.maxEmptyTurns = 2;
+		retries.maxMalformedRetries = 2;
+	}
 	resetFallbackNotice();
 	resetLastTurnHadReasoning();
 }
@@ -1991,4 +2708,1554 @@ test.serial('processAssistantResponse - does not start request on orphaned tool 
 	if (getAppConfig().sessions && originalMaxMessages !== undefined) {
 		getAppConfig().sessions!.maxMessages = originalMaxMessages;
 	}
+});
+
+test.serial('processAssistantResponse - a synthetic diagnostics prompt does not cancel the walkthrough', async t => {
+	// Reproduces the real approved-plan flow: the model edits files, the loop
+	// injects a synthetic user message (auto diagnostics, compaction, an
+	// empty-turn nudge), and only then does the model answer. The walkthrough
+	// requirement must survive that — it describes how the turn STARTED, so
+	// recreating it from the message tail would read the synthetic message as
+	// "the latest user message" and silently drop the requirement.
+	let chatCallCount = 0;
+	let nudge = '';
+	const client = {
+		chat: async (messages: Message[]): Promise<LLMChatResponse> => {
+			chatCallCount++;
+			if (chatCallCount === 1) {
+				// Model calls a tool, which drives the loop through its
+				// tool-execution recursion.
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										id: 'edit-1',
+										function: {name: 'some_tool', arguments: {}},
+									},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			}
+			if (chatCallCount === 2) {
+				return {
+					choices: [
+						{
+							message: {role: 'assistant', content: 'Implementation complete.'},
+						},
+					],
+					toolsDisabled: false,
+				};
+			}
+			nudge = messages.at(-1)?.content ?? '';
+			return {
+				choices: [{message: {role: 'assistant', content: 'Walkthrough saved.'}}],
+				toolsDisabled: false,
+			};
+		},
+	};
+
+	// Mirrors the state the loop reaches after the model edits files: the
+	// post-edit diagnostics prompt is appended with role 'user', so a naive
+	// "what did the user last say" scan sees it instead of the approval.
+	const messages: Message[] = [
+		{
+			role: 'user',
+			content: '<approved_plan>Implement artifacts.</approved_plan>',
+		},
+		{
+			role: 'user',
+			content:
+				'Automatic diagnostics after the recent edits found issues. Please fix the diagnostics you introduced before finishing.\n\nPaths needing attention:\n- a.ts',
+		},
+	];
+
+	await processAssistantResponse(
+		createDefaultParams({
+			client,
+			messages,
+			// yolo so the tool auto-executes and the loop takes its
+			// tool-execution recursion, which is where the lifecycle used to be
+			// dropped.
+			developmentMode: 'yolo',
+			toolManager: createMockToolManager({
+				tools: ['some_tool', 'write_walkthrough'],
+				needsApproval: false,
+			}),
+		}),
+	);
+
+	t.is(chatCallCount, 3, 'tool turn, answer turn, then the nudged turn');
+	t.true(
+		nudge.includes('write_walkthrough'),
+		'the walkthrough nudge must still fire once the real work is done',
+	);
+});
+// ============================================================================
+// Configurable Retry Limits (issue #897)
+// ============================================================================
+
+// Client that returns the identical tool call on every turn — the signature
+// the repeated-call loop detector keys on.
+const createRepeatingToolClient = (onChat?: () => void) => ({
+	chat: async (): Promise<LLMChatResponse> => {
+		onChat?.();
+		return {
+			choices: [
+				{
+					message: {
+						role: 'assistant',
+						content: '',
+						tool_calls: [
+							{
+								id: 'call_loop',
+								function: {name: 'read_file', arguments: '{"path": "/tmp/x"}'},
+							},
+						],
+					},
+				},
+			],
+			toolsDisabled: false,
+		};
+	},
+});
+
+const repeatingToolManager = () =>
+	createMockToolManager({tools: ['read_file'], needsApproval: false});
+
+// Pin the resolved retry limits for the duration of a test and restore them
+// afterwards. Without this the assertions read whatever `nanocoder.retries` the
+// developer happens to have in their project or personal config, since the
+// per-test clearAppConfig() re-resolves from disk.
+const withRetryLimits = async (
+	overrides: Partial<RetryLimitsConfig>,
+	run: () => Promise<void>,
+) => {
+	const retries = getAppConfig().retries;
+	if (!retries) {
+		throw new Error('Resolved config should always carry retry limits');
+	}
+	const originals = {...retries};
+	Object.assign(retries, overrides);
+	try {
+		await run();
+	} finally {
+		Object.assign(retries, originals);
+	}
+};
+
+test.serial('repeated-tool-call limit pauses and stops when the user declines', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		t.regex(question.question, /repeated the same tool call 3 times in a row/);
+		// First option is the safe default: stop.
+		return question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	// Default maxRepeatedToolCalls = 3: turns 1 and 2 execute, turn 3 trips
+	// the limit and prompts. Declining stops the loop.
+	t.is(chatCallCount, 3, 'Loop should stop at the default limit of 3');
+	t.is(questionCount, 1, 'Should pause and ask exactly once');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call 3 times in a row'),
+	);
+	t.truthy(stopMessage, 'Should queue the loop-detected ErrorMessage');
+});
+
+test.serial('a call with unparsable arguments is answered with the error and counts toward the limit', async t => {
+	// What the client returns for a call whose arguments could not be parsed
+	// (see convertAISDKToolCall): `{}` in their place, and the parse error.
+	let chatCallCount = 0;
+	let confirmPrompts = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+	const savedMessages: Message[][] = [];
+	setGlobalToolConfirmHandler(async () => {
+		confirmPrompts++;
+		return true;
+	});
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[0];
+	});
+
+	try {
+		await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+			await processAssistantResponse(
+				createDefaultParams({
+					client: {
+						chat: async (): Promise<LLMChatResponse> => {
+							chatCallCount++;
+							return {
+								choices: [
+									{
+										message: {
+											role: 'assistant',
+											content: '',
+											tool_calls: [
+												{
+													id: 'call_bad',
+													function: {name: 'read_file', arguments: {}},
+													argumentsError:
+														'not valid JSON: Unexpected end of JSON input',
+												},
+											],
+										},
+									},
+								],
+								toolsDisabled: false,
+							};
+						},
+					},
+					toolManager: createMockToolManager({
+						tools: ['read_file'],
+						needsApproval: true,
+					}),
+					addToChatQueue: (component: any) => queuedComponents.push(component),
+					setMessages: (messages: Message[]) => savedMessages.push(messages),
+				}),
+			);
+		});
+	} finally {
+		setGlobalToolConfirmHandler(async () => true);
+	}
+
+	// One model request per turn, and the third identical turn trips the limit.
+	t.is(chatCallCount, 3);
+	t.is(questionCount, 1);
+	t.is(confirmPrompts, 0, 'the user is never asked to approve a broken call');
+	t.truthy(
+		queuedComponents.find(
+			(c: any) =>
+				c.props?.message ===
+				'Model sent invalid arguments for "read_file" (not valid JSON: Unexpected end of JSON input) — asking it to retry.',
+		),
+	);
+	const result = savedMessages
+		.at(-1)
+		?.find(m => m.role === 'tool' && m.tool_call_id === 'call_bad');
+	t.regex(
+		String(result?.content),
+		/^Invalid arguments for tool "read_file": not valid JSON: Unexpected end of JSON input\. The call was not run\./,
+	);
+});
+
+test.serial('repeated-tool-call limit grants another window when the user continues', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const questionTexts: string[] = [];
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		questionTexts.push(question.question);
+		// Continue on the first prompt, stop on the second.
+		return questionCount === 1 ? question.options[1] : question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	// Continuing resets the streak: 3 turns to the first prompt, then 3 more
+	// identical turns to the second prompt, where the user stops.
+	t.is(chatCallCount, 6, 'Continue should grant a full new window of turns');
+	t.is(questionCount, 2, 'Should re-prompt after the granted window is spent');
+	// The per-window streak resets on continue, but the reported count is the
+	// true cumulative streak, so the second prompt says 6 rather than 3 again.
+	t.regex(questionTexts[0], /repeated the same tool call 3 times in a row/);
+	t.regex(questionTexts[1], /repeated the same tool call 6 times in a row/);
+	const continueNotice = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('Continuing'),
+	);
+	t.truthy(continueNotice, 'Should queue an InfoMessage when continuing');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call'),
+	);
+	t.regex(
+		stopMessage?.props?.message ?? '',
+		/repeated the same tool call 6 times in a row/,
+		'Stop message should report the cumulative streak, not the window count',
+	);
+});
+
+test.serial('repeated-tool-call limit does not fire one call under the limit', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[0];
+	});
+
+	// Two identical tool turns (one under the default limit of 3), then a
+	// terminal text-only response.
+	const client = {
+		chat: async (): Promise<LLMChatResponse> => {
+			chatCallCount += 1;
+			if (chatCallCount <= 2) {
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										id: 'call_loop',
+										function: {
+											name: 'read_file',
+											arguments: '{"path": "/tmp/x"}',
+										},
+									},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			}
+			return {
+				choices: [{message: {role: 'assistant', content: 'Done.'}}],
+				toolsDisabled: false,
+			};
+		},
+	};
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client,
+			toolManager: repeatingToolManager(),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'All three turns should run to natural completion');
+	t.is(questionCount, 0, 'Must not prompt below the limit');
+});
+
+test.serial('repeated-tool-call limit honors a custom configured value', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 2}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 2, 'Loop should stop at the configured limit of 2');
+	t.is(questionCount, 1, 'Should pause and ask at the configured limit');
+});
+
+test.serial('repeated-tool-call limit hard-stops without prompting in non-interactive mode', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[1];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			nonInteractiveMode: true,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'Loop should hard-stop at the limit');
+	t.is(questionCount, 0, 'Must not prompt when there is nobody to ask');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call'),
+	);
+	t.truthy(stopMessage, 'Should still queue the loop-detected ErrorMessage');
+});
+
+// Client that always calls a tool the tool manager does not know — this goes
+// through the unknown-tool error branch rather than tool execution.
+const createUnknownToolClient = (onChat?: () => void) => ({
+	chat: async (): Promise<LLMChatResponse> => {
+		onChat?.();
+		return {
+			choices: [
+				{
+					message: {
+						role: 'assistant',
+						content: '',
+						tool_calls: [
+							{
+								id: 'call_ghost',
+								function: {name: 'ghost_tool', arguments: '{"x": 1}'},
+							},
+						],
+					},
+				},
+			],
+			toolsDisabled: false,
+		};
+	},
+});
+
+test.serial('repeated unknown-tool calls count toward the repeated-call limit', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		t.regex(question.question, /repeated the same tool call 3 times in a row/);
+		// Stop: the safe default.
+		return question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	// The unknown-tool self-correction branch must not recurse unbounded: the
+	// third identical unknown-tool turn trips the same cap as a real call.
+	t.is(chatCallCount, 3, 'Third identical unknown-tool turn trips the limit');
+	t.is(questionCount, 1, 'Should pause and ask instead of recursing unbounded');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call 3 times in a row'),
+	);
+	t.truthy(stopMessage, 'Should queue the loop-detected ErrorMessage');
+});
+
+test.serial('repeated unknown-tool calls grant another window when the user continues', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const questionTexts: string[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		questionTexts.push(question.question);
+		// Continue on the first prompt, stop on the second.
+		return questionCount === 1 ? question.options[1] : question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 6, 'Continue should grant a full new window of turns');
+	t.is(questionCount, 2, 'Should re-prompt after the granted window is spent');
+	t.regex(questionTexts[0], /repeated the same tool call 3 times in a row/);
+	t.regex(questionTexts[1], /repeated the same tool call 6 times in a row/);
+});
+
+test.serial('unknown-tool feedback is paired with its call so it reaches the model', async t => {
+	// The error result only reaches the model when its tool_call is in the
+	// assistant message: dropOrphanedToolResults strips results whose call is
+	// missing, leaving the next turn's context unchanged and the model repeating
+	// the same ghost call until the cap trips.
+	const messageSnapshots: Message[][] = [];
+
+	setGlobalQuestionHandler(async question => question.options[0]);
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(),
+			toolManager: repeatingToolManager(),
+			setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant');
+	t.true(
+		(assistant?.tool_calls ?? []).some(tc => tc.id === 'call_ghost'),
+		'the ghost call must be in the assistant message',
+	);
+	const delivered = dropOrphanedToolResults(latest);
+	t.true(
+		delivered.some(m => m.role === 'tool' && m.tool_call_id === 'call_ghost'),
+		'the unknown-tool error must survive orphan pruning',
+	);
+});
+
+test.serial('non-interactive approval exit pairs unconfirmed tools with cancellation results', async t => {
+	const messageSnapshots: Message[][] = [];
+
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => ({
+				choices: [
+					{
+						message: {
+							role: 'assistant',
+							content: '',
+							tool_calls: [
+								{
+									id: 'call_guarded',
+									function: {name: 'guarded_tool', arguments: '{}'},
+								},
+							],
+						},
+					},
+				],
+				toolsDisabled: false,
+			}),
+		},
+		toolManager: createMockToolManager({
+			tools: ['guarded_tool'],
+			needsApproval: true,
+		}),
+		nonInteractiveMode: true,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	await processAssistantResponse(params);
+
+	// The exit is terminal, so the saved history must pair the announced call
+	// with a result - a later resume would otherwise replay an assistant
+	// tool_call that never received one, which strict providers reject.
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant' && m.tool_calls);
+	t.true(
+		(assistant?.tool_calls ?? []).some(tc => tc.id === 'call_guarded'),
+		'the guarded call must be announced in the assistant message',
+	);
+	const result = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_guarded',
+	);
+	t.truthy(result, 'the unconfirmed tool must get a paired result');
+	// Not the user-cancellation wording: nobody declined this tool, and a
+	// resumed interactive session must not read the history as a refusal.
+	t.regex(String(result?.content), /approval unavailable in non-interactive/i);
+	t.notRegex(String(result?.content), /cancelled by the user/i);
+});
+
+test.serial('escape mid-execution pairs the tools the confirm loop never reached', async t => {
+	const messageSnapshots: Message[][] = [];
+	const controller = new AbortController();
+
+	// Approve the first tool, then abort before it finishes so the loop breaks
+	// with the second tool still pending.
+	setGlobalToolConfirmHandler(async () => {
+		controller.abort();
+		return true;
+	});
+
+	let chatCallCount = 0;
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => {
+				chatCallCount += 1;
+				if (chatCallCount > 1) {
+					return {
+						choices: [{message: {role: 'assistant', content: 'Done.'}}],
+						toolsDisabled: false,
+					};
+				}
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										id: 'call_first',
+										function: {name: 'guarded_tool', arguments: '{}'},
+									},
+									{
+										id: 'call_second',
+										function: {name: 'guarded_tool', arguments: '{}'},
+									},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			},
+		},
+		toolManager: createMockToolManager({
+			tools: ['guarded_tool'],
+			needsApproval: true,
+		}),
+		abortController: controller,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	await processAssistantResponse(params);
+
+	setGlobalToolConfirmHandler(async () => false);
+
+	// The assistant message announces both calls, so the saved history must
+	// carry a result for the tool the abort skipped too.
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const assistant = latest.find(m => m.role === 'assistant' && m.tool_calls);
+	t.deepEqual(
+		(assistant?.tool_calls ?? []).map(tc => tc.id),
+		['call_first', 'call_second'],
+		'both calls must be announced in the assistant message',
+	);
+	for (const id of ['call_first', 'call_second']) {
+		t.truthy(
+			latest.find(m => m.role === 'tool' && m.tool_call_id === id),
+			`${id} must receive a paired tool result`,
+		);
+	}
+	const skipped = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_second',
+	);
+	t.regex(String(skipped?.content), /cancelled by the user/i);
+});
+
+test.serial('repeated unknown-tool calls hard-stop without prompting in non-interactive mode', async t => {
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[1];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createUnknownToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			nonInteractiveMode: true,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'Loop should hard-stop at the limit');
+	t.is(questionCount, 0, 'Must not prompt when there is nobody to ask');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call'),
+	);
+	t.truthy(stopMessage, 'Should still queue the loop-detected ErrorMessage');
+});
+
+test.serial('malformed-retry limit honors a custom configured value', async t => {
+	let chatCallCount = 0;
+	const queuedComponents: any[] = [];
+
+	const alwaysMalformedClient = {
+		chat: async (): Promise<LLMChatResponse> => {
+			chatCallCount += 1;
+			return {
+				choices: [
+					{
+						message: {
+							role: 'assistant',
+							content: '[tool_use: read_file]',
+							tool_calls: undefined,
+						},
+					},
+				],
+				toolsDisabled: true,
+			};
+		},
+	};
+
+	await withRetryLimits({maxMalformedRetries: 0}, async () => {
+		const params = createDefaultParams({
+			client: alwaysMalformedClient,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 1, 'Limit 0 should give up after the first bad turn');
+	const giveUpMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('malformed tool calls 1 time in a row'),
+	);
+	t.truthy(giveUpMessage, 'Give-up message should reflect the custom limit');
+});
+
+test.serial('empty-turn limit honors a custom configured value', async t => {
+	let chatCallCount = 0;
+	const queuedComponents: any[] = [];
+
+	const alwaysEmptyClient = {
+		chat: async (): Promise<LLMChatResponse> => {
+			chatCallCount += 1;
+			return {
+				choices: [
+					{message: {role: 'assistant', content: '', tool_calls: undefined}},
+				],
+				toolsDisabled: false,
+			};
+		},
+	};
+
+	await withRetryLimits({maxEmptyTurns: 0}, async () => {
+		const params = createDefaultParams({
+			client: alwaysEmptyClient,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	// Limit 0 skips all nudges: at most the initial turn plus one
+	// compact-and-retry cycle (MAX_COMPACT_RETRIES = 1). The default limit
+	// would make at least 3 calls before giving up.
+	t.true(
+		chatCallCount <= 2,
+		`Limit 0 should give up within 2 calls; got ${chatCallCount}`,
+	);
+	const giveUpMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('produced no output'),
+	);
+	t.truthy(giveUpMessage, 'Should queue the give-up ErrorMessage');
+});
+
+test.serial('repeated-tool-call limit still pauses in yolo mode', async t => {
+	// Yolo skips every tool confirmation, so the repeated-call pause is the one
+	// remaining safeguard there. Documented in docs/features/development-modes.md.
+	let chatCallCount = 0;
+	let questionCount = 0;
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[0];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			developmentMode: 'yolo' as const,
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'Loop should stop at the limit in yolo mode too');
+	t.is(questionCount, 1, 'Yolo must still get the repeated-call pause');
+});
+
+test.serial('repeated-tool-call limit hard-stops without prompting in headless mode', async t => {
+	// Headless is the daemon's mode for triggered skill runs. Like
+	// nonInteractiveMode there is nobody to ask, but it is a separate branch of
+	// the same guard, so it needs its own coverage.
+	let chatCallCount = 0;
+	let questionCount = 0;
+	const queuedComponents: any[] = [];
+
+	setGlobalQuestionHandler(async question => {
+		questionCount += 1;
+		return question.options[1];
+	});
+
+	await withRetryLimits({maxRepeatedToolCalls: 3}, async () => {
+		const params = createDefaultParams({
+			client: createRepeatingToolClient(() => chatCallCount++),
+			toolManager: repeatingToolManager(),
+			developmentMode: 'headless' as const,
+			addToChatQueue: (component: any) => queuedComponents.push(component),
+		});
+
+		await processAssistantResponse(params);
+	});
+
+	t.is(chatCallCount, 3, 'Loop should hard-stop at the limit');
+	t.is(questionCount, 0, 'Must not prompt in headless mode');
+	const stopMessage = queuedComponents.find(
+		(c: any) =>
+			typeof c.props?.message === 'string' &&
+			c.props.message.includes('repeated the same tool call'),
+	);
+	t.truthy(stopMessage, 'Should queue the loop-detected ErrorMessage');
+});
+
+// ============================================================================
+// Lifecycle hook gate (pre-tool-use)
+//
+// The gate has to sit in front of the approval prompt, not behind it. Behind
+// it, a "never touch .env" hook still renders the full confirmation with its
+// diff preview, waits for the user to approve, and only then refuses — the
+// tool is blocked either way, but the user is asked to authorize something
+// that was never going to run.
+// ============================================================================
+
+const HOOK_GATE_DIR = join(tmpdir(), `nanocoder-loop-hooks-${Date.now()}`);
+
+function withLoopHooks(hooks: HooksConfig): void {
+	writeFileSync(
+		join(HOOK_GATE_DIR, 'agents.config.json'),
+		JSON.stringify({nanocoder: {hooks}}),
+		'utf-8',
+	);
+	reloadAppConfig();
+}
+
+function enterHookFixture(): () => void {
+	const previousCwd = process.cwd();
+	const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+	mkdirSync(HOOK_GATE_DIR, {recursive: true});
+	process.env.NANOCODER_CONFIG_DIR = join(HOOK_GATE_DIR, 'no-global-config');
+	process.chdir(HOOK_GATE_DIR);
+	setProjectRoot(HOOK_GATE_DIR);
+	return () => {
+		process.chdir(previousCwd);
+		if (previousConfigDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+		}
+		setProjectRoot(previousCwd);
+		clearAppConfig();
+	};
+}
+
+// Portable hook body: `sh -c` on POSIX, `cmd /c` on Windows.
+const hookNode = (script: string) => `node -e "${script}"`;
+
+test.serial(
+	'a pre-tool-use veto blocks the tool without ever prompting for approval',
+	async t => {
+		const leave = enterHookFixture();
+		let confirmPrompts = 0;
+		const setMessagesCalls: Message[][] = [];
+		let chatCalls = 0;
+
+		try {
+			withLoopHooks({
+				'pre-tool-use': [
+					{
+						name: 'no-env',
+						command: hookNode(
+							"console.log('.env is off limits');process.exit(1)",
+						),
+					},
+				],
+			});
+
+			// If the gate were behind the approval prompt, this would fire.
+			setGlobalToolConfirmHandler(async () => {
+				confirmPrompts++;
+				return true;
+			});
+
+			const mockClient = createMockClient({content: '', toolCalls: []});
+			mockClient.chat = async () => {
+				chatCalls++;
+				if (chatCalls === 1) {
+					return {
+						choices: [
+							{
+								message: {
+									role: 'assistant',
+									content: '',
+									tool_calls: [
+										{
+											id: 'call_1',
+											function: {
+												name: 'some_tool',
+												arguments: '{"path":".env"}',
+											},
+										},
+									],
+								},
+							},
+						],
+						toolsDisabled: false,
+					} as never;
+				}
+				// Terminal turn so the loop stops after the blocked result.
+				return {
+					choices: [{message: {role: 'assistant', content: 'understood'}}],
+					toolsDisabled: false,
+				} as never;
+			};
+
+			const params = createDefaultParams({
+				client: mockClient,
+				toolManager: createMockToolManager({
+					tools: ['some_tool'],
+					needsApproval: true,
+				}) as never,
+				nonInteractiveMode: false,
+				setMessages: (m: Message[]) => setMessagesCalls.push(m),
+			});
+
+			await processAssistantResponse(params as never);
+		} finally {
+			setGlobalToolConfirmHandler(async () => true);
+			leave();
+		}
+
+		t.is(
+			confirmPrompts,
+			0,
+			'a vetoed tool must never reach the confirmation prompt',
+		);
+
+		const toolResults = setMessagesCalls
+			.flat()
+			.filter(m => m.role === 'tool')
+			.map(m => String(m.content));
+		t.true(
+			toolResults.some(c => c.includes('.env is off limits')),
+			`the hook's reason should reach the model, got: ${toolResults.join(' | ')}`,
+		);
+	},
+);
+
+test.serial(
+	'a passing pre-tool-use hook still lets the approval prompt run',
+	async t => {
+		const leave = enterHookFixture();
+		let confirmPrompts = 0;
+		let chatCalls = 0;
+
+		try {
+			withLoopHooks({
+				'pre-tool-use': [{command: hookNode('process.exit(0)')}],
+			});
+
+			setGlobalToolConfirmHandler(async () => {
+				confirmPrompts++;
+				return false; // decline, so the loop stops deterministically
+			});
+
+			const mockClient = createMockClient({content: '', toolCalls: []});
+			mockClient.chat = async () => {
+				chatCalls++;
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{
+										id: 'call_1',
+										function: {name: 'some_tool', arguments: '{}'},
+									},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				} as never;
+			};
+
+			const params = createDefaultParams({
+				client: mockClient,
+				toolManager: createMockToolManager({
+					tools: ['some_tool'],
+					needsApproval: true,
+				}) as never,
+				nonInteractiveMode: false,
+			});
+
+			await processAssistantResponse(params as never);
+		} finally {
+			setGlobalToolConfirmHandler(async () => true);
+			leave();
+		}
+
+		t.is(
+			confirmPrompts,
+			1,
+			'the gate must not swallow the approval prompt for an allowed tool',
+		);
+	},
+);
+
+// ============================================================================
+// Top-level alwaysAllow in interactive sessions
+//
+// nanocoder.alwaysAllow used to reach resolveToolApproval only in
+// non-interactive runs, so tools with a hard `approval: true` (git_commit,
+// custom `approval: always` tools) still prompted in the TUI.
+// ============================================================================
+
+for (const [listed, expectedPrompts] of [
+	[true, 0],
+	[false, 1],
+] as const) {
+	test.serial(
+		`interactive loop ${listed ? 'skips' : 'keeps'} the prompt for a tool ${listed ? 'in' : 'not in'} alwaysAllow`,
+		async t => {
+			const leave = enterHookFixture();
+			let confirmPrompts = 0;
+			let chatCalls = 0;
+			try {
+				writeFileSync(
+					join(HOOK_GATE_DIR, 'agents.config.json'),
+					JSON.stringify({
+						nanocoder: {alwaysAllow: listed ? ['some_tool'] : []},
+					}),
+					'utf-8',
+				);
+				reloadAppConfig();
+				setGlobalToolConfirmHandler(async () => {
+					confirmPrompts++;
+					return true;
+				});
+
+				const mockClient = createMockClient({content: '', toolCalls: []});
+				mockClient.chat = async () => {
+					chatCalls++;
+					if (chatCalls === 1) {
+						return {
+							choices: [
+								{
+									message: {
+										role: 'assistant',
+										content: '',
+										tool_calls: [
+											{
+												id: 'call_1',
+												function: {name: 'some_tool', arguments: '{}'},
+											},
+										],
+									},
+								},
+							],
+							toolsDisabled: false,
+						} as never;
+					}
+					return {
+						choices: [{message: {role: 'assistant', content: 'done'}}],
+						toolsDisabled: false,
+					} as never;
+				};
+
+				await processAssistantResponse(
+					createDefaultParams({
+						client: mockClient,
+						toolManager: createMockToolManager({
+							tools: ['some_tool'],
+							needsApproval: true,
+						}) as never,
+						nonInteractiveMode: false,
+					}) as never,
+				);
+			} finally {
+				setGlobalToolConfirmHandler(async () => true);
+				leave();
+			}
+
+			t.is(confirmPrompts, expectedPrompts);
+		},
+	);
+}
+
+test.serial('escape during an auto-approved tool stops the rest of the batch', async t => {
+	const controller = new AbortController();
+	const messageSnapshots: Message[][] = [];
+	const ran: string[] = [];
+	setToolRegistryGetter(() => ({
+		slow_bash: async () => {
+			ran.push('slow_bash');
+			controller.abort();
+			return 'bash done';
+		},
+		write_tool: async () => {
+			ran.push('write_tool');
+			return 'written';
+		},
+	}));
+
+	let chatCallCount = 0;
+	const params = createDefaultParams({
+		client: {
+			chat: async (): Promise<LLMChatResponse> => {
+				chatCallCount += 1;
+				if (chatCallCount > 1) {
+					throw new Error('Operation was cancelled');
+				}
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{id: 'call_bash', function: {name: 'slow_bash', arguments: '{}'}},
+									{id: 'call_write', function: {name: 'write_tool', arguments: '{}'}},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			},
+		},
+		toolManager: {
+			...createMockToolManager({
+				tools: ['slow_bash', 'write_tool'],
+				needsApproval: false,
+			}),
+			getToolFormatter: () => undefined,
+		},
+		developmentMode: 'yolo' as const,
+		abortController: controller,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	try {
+		await t.throwsAsync(processAssistantResponse(params), {
+			message: 'Operation was cancelled',
+		});
+	} finally {
+		setToolRegistryGetter(() => ({}));
+	}
+
+	t.deepEqual(ran, ['slow_bash'], 'the tool queued behind the cancel must not run');
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const skipped = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_write',
+	);
+	t.regex(String(skipped?.content), /cancelled by the user/i);
+	t.truthy(
+		latest.find(m => m.role === 'tool' && m.tool_call_id === 'call_bash'),
+	);
+});
+
+test.serial('escape while the reply finishes does not execute its tool calls', async t => {
+	const controller = new AbortController();
+	const messageSnapshots: Message[][] = [];
+	let ran = false;
+	setToolRegistryGetter(() => ({
+		write_tool: async () => {
+			ran = true;
+			return 'written';
+		},
+	}));
+
+	const params = createDefaultParams({
+		client: {
+			// The provider returns a complete reply even though the user pressed
+			// Escape before it finished.
+			chat: async (): Promise<LLMChatResponse> => {
+				controller.abort();
+				return {
+					choices: [
+						{
+							message: {
+								role: 'assistant',
+								content: '',
+								tool_calls: [
+									{id: 'call_write', function: {name: 'write_tool', arguments: '{}'}},
+								],
+							},
+						},
+					],
+					toolsDisabled: false,
+				};
+			},
+		},
+		toolManager: createMockToolManager({
+			tools: ['write_tool'],
+			needsApproval: false,
+		}),
+		developmentMode: 'yolo' as const,
+		abortController: controller,
+		setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+	});
+
+	try {
+		await t.throwsAsync(processAssistantResponse(params), {
+			message: 'Operation was cancelled',
+		});
+	} finally {
+		setToolRegistryGetter(() => ({}));
+	}
+
+	t.false(ran);
+	const latest = messageSnapshots[messageSnapshots.length - 1];
+	const paired = latest.find(
+		m => m.role === 'tool' && m.tool_call_id === 'call_write',
+	);
+	t.regex(String(paired?.content), /cancelled by the user/i);
+});
+
+// Declining a tool ends the turn. The app only drains messages the user
+// queued while the prompt was up once the loop reports completion.
+for (const scenario of [
+	{label: 'the user declines', abort: false},
+	{label: 'an abort settles the prompt', abort: true},
+] as const) {
+	test.serial(`a declined tool signals conversation completion when ${scenario.label}`, async t => {
+		const controller = new AbortController();
+		setGlobalToolConfirmHandler(async () => {
+			if (scenario.abort) controller.abort();
+			return false;
+		});
+		let completions = 0;
+		let chatCalls = 0;
+		const params = createDefaultParams({
+			client: {
+				chat: async (): Promise<LLMChatResponse> => {
+					chatCalls++;
+					return {
+						choices: [
+							{
+								message: {
+									role: 'assistant',
+									content: '',
+									tool_calls: [
+										{id: 'call_guarded', function: {name: 'guarded_tool', arguments: '{}'}},
+									],
+								},
+							},
+						],
+						toolsDisabled: false,
+					};
+				},
+			},
+			toolManager: createMockToolManager({
+				tools: ['guarded_tool'],
+				needsApproval: true,
+			}),
+			abortController: controller,
+			onConversationComplete: () => {
+				completions++;
+			},
+		});
+
+		try {
+			await processAssistantResponse(params);
+		} finally {
+			setGlobalToolConfirmHandler(async () => true);
+		}
+
+		t.is(chatCalls, 1, 'a decline does not re-prompt the model');
+		t.is(completions, 1);
+	});
+}
+
+test.serial('compact-and-retry keeps the turn controller, a single history write and a restore point', async t => {
+	const {compressionBackup} = await import('@/conversation/compaction/compression-backup.js');
+	compressionBackup.clearBackup();
+	const signals: (AbortSignal | undefined)[] = [];
+	const messageSnapshots: Message[][] = [];
+	const longContent =
+		'Verbose conversation content that exceeds thresholds for mechanical compression. '.repeat(30);
+	const history: Message[] = [
+		{role: 'user', content: longContent},
+		{role: 'assistant', content: 'Prior response.'},
+		{role: 'user', content: 'Continue'},
+	];
+	let created = 0;
+
+	await withRetryLimits({maxEmptyTurns: 0}, async () => {
+		await processAssistantResponse(
+			createDefaultParams({
+				client: {
+					chat: async (
+						_messages: Message[],
+						_tools: unknown,
+						_callbacks: unknown,
+						signal?: AbortSignal,
+					): Promise<LLMChatResponse> => {
+						signals.push(signal);
+						return {
+							choices: [{message: {role: 'assistant', content: ''}}],
+							toolsDisabled: false,
+						};
+					},
+				},
+				messages: history,
+				// The prop is stale (null) on the first call, as in the app.
+				abortController: null,
+				setAbortController: (next: AbortController | null) => {
+					if (next) created++;
+				},
+				setMessages: (msgs: Message[]) => messageSnapshots.push(msgs),
+			}) as never,
+		);
+	});
+
+	t.is(signals.length, 2, 'the initial turn plus one compact-and-retry');
+	t.is(created, 1, 'the retry must reuse the turn controller');
+	t.is(signals[1], signals[0]);
+
+	// The empty turns add nothing to history, so the compaction is the only
+	// write: the compressed history together with its nudge, in one update.
+	t.is(messageSnapshots.length, 1);
+	t.is(
+		messageSnapshots[0]?.at(-1)?.content,
+		'Context has been compacted. Please continue with the task.',
+	);
+	t.deepEqual(
+		compressionBackup.getBackup()?.map(m => m.content),
+		history.map(m => m.content),
+		'/compact --restore must be able to undo this compaction',
+	);
+	compressionBackup.clearBackup();
+});
+
+test.serial('auto-compact gates on the capped history the request sends, not the full history', async t => {
+	setupAutoCompactTestEnv();
+	setAutoCompactStrategy('mechanical');
+	// Large enough for the capped view, far too small for the full history.
+	setSessionContextLimit(2000);
+	const config = getAppConfig();
+	const originalSessions = config.sessions;
+	config.sessions = {...originalSessions, maxMessages: 2} as typeof config.sessions;
+
+	// Old rows the cap already drops from every request.
+	const oldVerboseContent = 'old context sentence. '.repeat(400);
+	const history: Message[] = [
+		{role: 'user', content: oldVerboseContent},
+		{role: 'assistant', content: oldVerboseContent},
+		{role: 'user', content: 'Recent request'},
+	];
+	const snapshots: Message[][] = [];
+	const notices: unknown[] = [];
+
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client: createMockClient({content: 'Done.'}),
+				messages: history,
+				currentProvider: 'openai',
+				currentModel: 'gpt-4',
+				setMessages: (msgs: Message[]) => snapshots.push(msgs),
+				addToChatQueue: (component: any) => notices.push(component),
+			}) as never,
+		);
+	} finally {
+		config.sessions = originalSessions;
+	}
+
+	const compactNotice = notices.find(
+		(c: any) => c?.props?.message && String(c.props.message).includes('compact'),
+	);
+	t.falsy(compactNotice, 'the request was well under the limit, so nothing compacts');
+	// The full history (old rows included) is kept, plus the reply.
+	t.is(snapshots.at(-1)?.length, history.length + 1);
+	t.is(snapshots.at(-1)?.[0]?.content, oldVerboseContent);
+});
+
+test.serial('a thinking turn does not indent tool summaries for a later non-thinking conversation', async t => {
+	resetLastTurnHadReasoning();
+	// A conversation with a thinking model.
+	await processAssistantResponse(
+		createDefaultParams({
+			client: createMockClient({content: 'Thought it through.', reasoning: 'Hmm.'}),
+		}) as never,
+	);
+
+	// Then a non-thinking model runs a tool and answers.
+	setToolRegistryGetter(() => ({some_tool: async () => 'ok'}));
+	const queued: any[] = [];
+	const compactToolCountsRef = {current: {} as Record<string, number>};
+	let calls = 0;
+	try {
+		await processAssistantResponse(
+			createDefaultParams({
+				client: {
+					chat: async (): Promise<LLMChatResponse> => {
+						calls++;
+						return {
+							choices: [
+								{
+									message:
+										calls === 1
+											? {
+													role: 'assistant',
+													content: '',
+													tool_calls: [
+														{id: 'call_1', function: {name: 'some_tool', arguments: '{}'}},
+													],
+												}
+											: {role: 'assistant', content: 'Done.'},
+								},
+							],
+							toolsDisabled: false,
+						};
+					},
+				},
+				toolManager: {
+					...createMockToolManager({tools: ['some_tool'], needsApproval: false}),
+					getToolFormatter: () => undefined,
+				},
+				developmentMode: 'yolo' as const,
+				compactToolDisplayRef: {current: true},
+				compactToolCountsRef,
+				onSetCompactToolCounts: () => {},
+				addToChatQueue: (component: any) => queued.push(component),
+			}) as never,
+		);
+	} finally {
+		setToolRegistryGetter(() => ({}));
+	}
+
+	const summary = queued.find((c: any) =>
+		String(c?.key).includes('tool-compact-summary'),
+	);
+	t.truthy(summary, 'the tool run is summarised');
+	t.is(summary?.props.marginLeft, 0, 'no Thought to group under, so render flat');
+});
+
+// ============================================================================
+// nanocoder.verify: a turn that edited files cannot end without evidence
+// ============================================================================
+
+const verifyTurns = (bashCommand: string) => [
+	{role: 'assistant', content: '', tool_calls: [{id: 'w', function: {name: 'write_file', arguments: {path: 'a.ts', content: 'x'}}}]},
+	{role: 'assistant', content: 'Done.'},
+	{role: 'assistant', content: '', tool_calls: [{id: 'b', function: {name: 'execute_bash', arguments: {command: bashCommand}}}]},
+	{role: 'assistant', content: 'Confirmed.'},
+	{role: 'assistant', content: 'Fine.'},
+];
+
+// `confirm` runs the tools through the user-confirmation path instead of yolo.
+async function runVerifiedTurn(
+	bashOutput: string,
+	bashCommand = 'pnpm test',
+	confirm = false,
+) {
+	let prompts = 0;
+	setGlobalToolConfirmHandler(async () => {
+		prompts++;
+		return true;
+	});
+	setToolRegistryGetter(() => ({
+		write_file: (async () => 'File written') as never,
+		execute_bash: (async () => bashOutput) as never,
+	}));
+	const previous = getAppConfig().verify;
+	getAppConfig().verify = {required: ['pnpm test']};
+	let calls = 0;
+	const seen: string[] = [];
+	const notes: string[] = [];
+	let completed = 0;
+	const turns = verifyTurns(bashCommand);
+	const client = {
+		chat: async (messages: Message[]): Promise<LLMChatResponse> => {
+			seen.push(messages.at(-1)?.content ?? '');
+			return {choices: [{message: turns[calls++]}], toolsDisabled: false} as never;
+		},
+	};
+	try {
+		await processAssistantResponse(createDefaultParams({
+			client,
+			toolManager: {
+				...createMockToolManager({tools: ['write_file', 'execute_bash'], needsApproval: confirm}),
+				getToolFormatter: () => undefined,
+			},
+			developmentMode: confirm ? 'normal' : 'yolo',
+			addToChatQueue: (node: {props?: {message?: string}}) => {
+				notes.push(String(node?.props?.message ?? ''));
+			},
+			onConversationComplete: () => {
+				completed++;
+			},
+		}) as never);
+	} finally {
+		getAppConfig().verify = previous;
+		setToolRegistryGetter(() => ({}));
+	}
+	return {calls, seen, notes, completed, prompts};
+}
+
+test.serial('processAssistantResponse - nanocoder.verify sends the model back until the required command passes', async t => {
+	const {calls, seen, notes, completed} = await runVerifiedTurn('EXIT_CODE: 0\nok');
+
+	t.is(calls, 4);
+	t.true(seen[2]?.includes('`pnpm test` (not run)'), 'the model is told what to run');
+	t.is(completed, 1);
+	t.true(notes.some(note => note.includes('not verified yet')), 'the user sees why it continues');
+	t.true(notes.includes('Verification: ✓ pnpm test (exit 0)'));
+});
+
+test.serial('processAssistantResponse - nanocoder.verify does not accept a failing run', async t => {
+	const {calls, seen, notes, completed} = await runVerifiedTurn('EXIT_CODE: 1\nFAIL');
+
+	t.is(calls, 5, 'reminded again after the failure, then allowed to finish');
+	t.true(seen[4]?.includes('last run exited 1'));
+	t.is(completed, 1);
+	t.true(notes.includes('Verification: ✗ pnpm test (last run exited 1)'));
+});
+
+test.serial('processAssistantResponse - nanocoder.verify ignores a piped run', async t => {
+	const {seen} = await runVerifiedTurn('EXIT_CODE: 0\nok', 'pnpm test | tail -5');
+
+	t.true(seen[4]?.includes('hidden by a pipe'));
+});
+
+test.serial('processAssistantResponse - nanocoder.verify also counts tools the user confirmed', async t => {
+	const {calls, seen, notes, prompts} = await runVerifiedTurn('EXIT_CODE: 0\nok', 'pnpm test', true);
+
+	t.is(prompts, 2, 'both tools went through the confirmation path');
+	t.is(calls, 4);
+	t.true(seen[2]?.includes('`pnpm test` (not run)'));
+	t.true(notes.includes('Verification: ✓ pnpm test (exit 0)'));
 });

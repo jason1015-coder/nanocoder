@@ -11,7 +11,7 @@ import {useTheme} from '@/hooks/useTheme';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {execGit, truncateDiff} from './utils';
+import {execGitReadOnly, truncateDiff} from './utils';
 
 // ============================================================================
 // Types
@@ -24,35 +24,50 @@ interface GitDiffInput {
 	stat?: boolean;
 }
 
+const MAX_DIFF_LINES = 500;
+
+function buildGitDiffArgs(
+	args: GitDiffInput,
+	includeStat = Boolean(args.stat),
+): string[] {
+	const gitArgs: string[] = ['diff', '--no-ext-diff', '--no-textconv'];
+
+	if (args.staged) {
+		gitArgs.push('--cached');
+	}
+
+	if (includeStat) {
+		gitArgs.push('--stat-count=20', '--stat');
+	}
+
+	if (args.base) {
+		// `--end-of-options` stops option parsing so the revision can never
+		// be reinterpreted as a flag (e.g. `--output=<file>`).
+		gitArgs.push('--end-of-options', args.base);
+	}
+
+	if (args.file) {
+		gitArgs.push('--', args.file);
+	}
+
+	return gitArgs;
+}
+
 // ============================================================================
 // Execution
 // ============================================================================
 
 const executeGitDiff = async (args: GitDiffInput): Promise<string> => {
 	try {
-		const gitArgs: string[] = ['diff'];
-
-		// Add --cached for staged changes
-		if (args.staged) {
-			gitArgs.push('--cached');
+		// The base is passed to git as a positional argument, so a value
+		// starting with "-" would be parsed as an option (e.g. --output=<file>),
+		// letting a read-only tool write files. Reject it up front, mirroring
+		// the branch guard in git_log.
+		if (args.base?.startsWith('-')) {
+			return `Error: Invalid base: ${args.base}`;
 		}
 
-		// Add base reference (branch or commit)
-		if (args.base) {
-			gitArgs.push(args.base);
-		}
-
-		// Show stat only
-		if (args.stat) {
-			gitArgs.push('--stat');
-		}
-
-		// Specific file
-		if (args.file) {
-			gitArgs.push('--', args.file);
-		}
-
-		const output = await execGit(gitArgs);
+		const output = await execGitReadOnly(buildGitDiffArgs(args));
 
 		if (!output.trim()) {
 			if (args.staged) {
@@ -64,11 +79,31 @@ const executeGitDiff = async (args: GitDiffInput): Promise<string> => {
 			return 'No unstaged changes.';
 		}
 
-		// Truncate if too long (unless stat mode which is already compact)
+		// Summarize oversized full diffs to avoid sending large patches to the model.
 		if (!args.stat) {
-			const {content, truncated, totalLines} = truncateDiff(output, 500);
+			const {content, truncated, totalLines} = truncateDiff(
+				output,
+				MAX_DIFF_LINES,
+			);
 			if (truncated) {
-				return `${content}\n\n[Total: ${totalLines} lines]`;
+				const filesChanged = output.match(/^diff --git /gm)?.length ?? 0;
+				if (filesChanged <= 1) {
+					return content;
+				}
+
+				try {
+					const statOutput = await execGitReadOnly(
+						buildGitDiffArgs(args, true),
+					);
+					return (
+						`${statOutput}\n\n` +
+						`Diff is too large to return in full (${totalLines} lines). ` +
+						'Use the file parameter to request a specific path for detailed output.'
+					);
+				} catch {
+					// Keep the result bounded even if the summary command fails.
+					return content;
+				}
 			}
 		}
 

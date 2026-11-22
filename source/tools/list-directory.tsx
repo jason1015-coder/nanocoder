@@ -1,15 +1,16 @@
 import {lstat, readdir} from 'node:fs/promises';
-import {join} from 'node:path';
+import {join, relative} from 'node:path';
 import {Box, Text} from 'ink';
 import React from 'react';
 import ToolMessage from '@/components/tool-message';
 import {ThemeContext} from '@/hooks/useTheme';
+import {getProjectRoot, getSafeSessionCwd} from '@/services/session-cwd';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {loadGitignore} from '@/utils/gitignore-loader';
-import {isValidFilePath, resolveFilePath} from '@/utils/path-validation';
-import {calculateTokens} from '@/utils/token-calculator';
+import {loadGitignore} from '@/utils/fs/gitignore-loader';
+import {isValidFilePath, resolveFilePath} from '@/utils/fs/path-validation';
+import {estimateTokens} from '@/utils/token-calculator';
 
 interface ListDirectoryArgs {
 	path?: string;
@@ -17,6 +18,7 @@ interface ListDirectoryArgs {
 	maxDepth?: number;
 	tree?: boolean;
 	showHiddenFiles?: boolean;
+	showSizes?: boolean;
 }
 
 interface DirectoryEntry {
@@ -34,17 +36,29 @@ const executeListDirectory = async (
 	const maxDepth = args.maxDepth ?? 3;
 	const tree = args.tree ?? false;
 	const showHiddenFiles = args.showHiddenFiles ?? false;
+	const showSizes = args.showSizes ?? false;
 
 	// Validate path
-	if (!isValidFilePath(dirPath)) {
+	const cwd = getSafeSessionCwd();
+	const root = getProjectRoot();
+	if (!isValidFilePath(dirPath, root)) {
 		throw new Error(
-			`⚒ Invalid path. Path must be relative and within the project directory.`,
+			`⚒ Invalid path. Path must be within the project directory.`,
 		);
 	}
 
-	const cwd = process.cwd();
-	const resolvedPath = resolveFilePath(dirPath, cwd);
-	const ig = loadGitignore(cwd);
+	const resolvedPath = resolveFilePath(dirPath, cwd, root);
+	// Dotfiles stay hidden unless the caller explicitly asked for a hidden
+	// directory (`.github`, `./.config`). Match the project-relative path, not
+	// the raw argument: `'.'.startsWith('.')` is true and used to leak every
+	// dotfile at the project root (#1237), and an absolute path would otherwise
+	// pick up hidden *ancestors* of the project itself (`~/.local/share/proj`).
+	const listingHiddenDir = /(^|[/\\])\.[^./\\]/.test(
+		relative(root, resolvedPath),
+	);
+	// Load from the project root so root-level rules still apply after a `cd`
+	// into a subdir; entries are matched root-relative below.
+	const ig = loadGitignore(root);
 
 	try {
 		const entries: DirectoryEntry[] = [];
@@ -64,14 +78,24 @@ const executeListDirectory = async (
 					if (
 						!showHiddenFiles &&
 						item.name.startsWith('.') &&
-						!dirPath.startsWith('.')
+						!listingHiddenDir
 					) {
 						continue;
 					}
 
-					// Check if this item should be ignored using gitignore patterns
-					const itemPath = relativeTo ? join(relativeTo, item.name) : item.name;
-					if (ig.ignores(itemPath)) {
+					const fullPath = join(currentPath, item.name);
+
+					// Check if this item should be ignored using gitignore patterns.
+					// Match root-relative so the project-root .gitignore applies. A
+					// directory is tested with its trailing slash too: a
+					// directory-only pattern (`node_modules/`, `dist/`) matches only
+					// that form, so without it the ignored folder still listed and
+					// then read back as empty.
+					const ignorePath = relative(root, fullPath);
+					if (
+						ig.ignores(ignorePath) ||
+						(item.isDirectory() && ig.ignores(`${ignorePath}/`))
+					) {
 						continue;
 					}
 
@@ -82,12 +106,13 @@ const executeListDirectory = async (
 						type = 'directory';
 					}
 
-					const fullPath = join(currentPath, item.name);
 					const relativePath = join(relativeTo, item.name);
 
-					// Only get stats for files (to get size)
+					// Only get stats for files (to get size), and only when sizes
+					// were requested — lstat is a syscall per file, not worth
+					// paying for on every listing.
 					let size: number | undefined;
-					if (type === 'file') {
+					if (type === 'file' && showSizes) {
 						try {
 							const stats = await lstat(fullPath);
 							size = stats.size;
@@ -153,9 +178,7 @@ const executeListDirectory = async (
 							? '@'
 							: '';
 				const displayPath = recursive ? entry.relativePath : entry.name;
-				const sizeStr = entry.size
-					? ` (${entry.size.toLocaleString()} bytes)`
-					: '';
+				const sizeStr = entry.size ? ` (${entry.size} bytes)` : '';
 				output += `${displayPath}${suffix}${sizeStr}\n`;
 			}
 		}
@@ -180,7 +203,7 @@ const executeListDirectory = async (
 
 const listDirectoryCoreTool = tool({
 	description:
-		'List directory contents with file sizes. Use this INSTEAD OF bash ls/ls -la/ls -R commands. Use recursive=true with maxDepth for nested exploration. Use tree=true for flat paths (easier to parse). Best for: exploring unknown directories, seeing file sizes, understanding project structure. For finding specific files by pattern, use find_files instead.',
+		"List directory contents. Use this INSTEAD OF bash ls/ls -la/ls -R commands. Use recursive=true with maxDepth for nested exploration. Use tree=true for flat paths (easier to parse). Use showSizes=true to include file sizes (off by default; use read_file with metadata_only=true for a single file's size instead). Best for: exploring unknown directories, understanding project structure. For finding specific files by pattern, use find_files instead.",
 	inputSchema: jsonSchema<ListDirectoryArgs>({
 		type: 'object',
 		properties: {
@@ -208,6 +231,11 @@ const listDirectoryCoreTool = tool({
 				type: 'boolean',
 				description:
 					'If true, include hidden files and directories (default: false). Use with caution to avoid exposing sensitive files like .env.',
+			},
+			showSizes: {
+				type: 'boolean',
+				description:
+					"If true, include each file's size in bytes (default: false). Rarely needed just to orient in a directory; costs an extra stat call per file plus output tokens.",
 			},
 		},
 		required: [],
@@ -317,7 +345,7 @@ const listDirectoryFormatter = (
 	// Calculate tokens from the result
 	let tokens = 0;
 	if (result) {
-		tokens = calculateTokens(result);
+		tokens = estimateTokens(result);
 	}
 
 	return <ListDirectoryFormatter args={args} result={result} tokens={tokens} />;

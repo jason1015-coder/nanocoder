@@ -1,19 +1,20 @@
 import {Box, Text, useInput} from 'ink';
-import SelectInput from 'ink-select-input';
 import React from 'react';
 import {RenderErrorBoundary} from '@/components/render-error-boundary';
+import {StyledSelectInput} from '@/components/ui/styled-select-input';
+import {TitledBoxWithPreferences} from '@/components/ui/titled-box';
 import {useTerminalWidth} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
 import {getToolManager} from '@/message-handler';
-import type {ToolCall} from '@/types/core';
-import {formatError} from '@/utils/error-formatter';
-import {getLogger} from '@/utils/logging';
 import {
 	getToolJsonSchema,
 	validateArgsAgainstSchema,
-} from '@/utils/schema-validate';
-import {parseToolArguments} from '@/utils/tool-args-parser';
-import {formatValidationError} from '@/utils/tool-validation';
+} from '@/tools/runtime/schema-validate';
+import {parseToolArguments} from '@/tools/runtime/tool-args-parser';
+import {formatValidationError} from '@/tools/runtime/tool-validation';
+import type {ToolCall} from '@/types/core';
+import {formatError} from '@/utils/error-formatter';
+import {getLogger} from '@/utils/logging';
 
 interface ToolConfirmationProps {
 	toolCall: ToolCall;
@@ -39,9 +40,40 @@ export default function ToolConfirmation({
 	const [isLoadingPreview, setIsLoadingPreview] = React.useState(false);
 	const [hasFormatterError, setHasFormatterError] = React.useState(false);
 	const [hasValidationError, setHasValidationError] = React.useState(false);
-	const [_validationError, setValidationError] = React.useState<string | null>(
-		null,
-	);
+	// True until the schema check, validator and formatter preview have all
+	// settled. The Yes/No selector stays unmounted until then so Enter cannot
+	// approve a call before it has been checked and shown. Escape still cancels.
+	const [isChecking, setIsChecking] = React.useState(true);
+
+	// One answer per request. The queue in useGlobalHandlerQueues resolves its
+	// head on every answer, so a second answer for a request that is already
+	// settled would consume the NEXT queued request and resolve it with this
+	// answer without ever showing it — a silent approval of a tool the user was
+	// never asked about. Escape and the formatter-crash auto-cancel below are
+	// two paths into the same slot, so the guard covers all of them.
+	//
+	// Reset when a new request arrives: chat-input keys this component on
+	// toolCall.id so queue advances remount it, but the guard must not depend on
+	// that key surviving a future refactor. Mirrors question-prompt.tsx.
+	const answeredRef = React.useRef(false);
+	const [previousToolCall, setPreviousToolCall] = React.useState(toolCall);
+	if (toolCall !== previousToolCall) {
+		setPreviousToolCall(toolCall);
+		answeredRef.current = false;
+		// Reset during render, not in the preview effect: the auto-cancel effect
+		// runs in the same commit and would act on the previous request's
+		// formatter error, cancelling the new call before it is shown.
+		setIsChecking(true);
+		setIsLoadingPreview(false);
+		setHasFormatterError(false);
+		setHasValidationError(false);
+		setFormatterPreview(null);
+	}
+	const answerOnce = React.useCallback((settle: () => void) => {
+		if (answeredRef.current) return;
+		answeredRef.current = true;
+		settle();
+	}, []);
 
 	// Get MCP tool info for display
 	const toolManager = getToolManager();
@@ -51,104 +83,131 @@ export default function ToolConfirmation({
 
 	// Load formatter preview
 	React.useEffect(() => {
+		// A newer request (or theme change) re-runs this effect; results from
+		// the stale run must not open the gate for the new one.
+		let cancelled = false;
+		setIsChecking(true);
+		setIsLoadingPreview(false);
+		setHasFormatterError(false);
+		setHasValidationError(false);
+		setFormatterPreview(null);
+
 		const loadPreview = async () => {
-			if (!toolManager) return;
-
-			let parsedArgs: Record<string, unknown> = {};
 			try {
-				parsedArgs = parseToolArguments(toolCall.function.arguments);
-			} catch {
-				// Leave as {} — the schema/validator will surface the real problem.
-			}
+				if (!toolManager) return;
 
-			// 1. Schema type-check — the same check the executed handler runs, so a
-			// wrong-typed argument shows red here and is fed back to the model.
-			const schema = getToolJsonSchema(
-				toolManager.getToolEntry(toolCall.function.name)?.tool,
-			);
-			const typeErrors = schema
-				? validateArgsAgainstSchema(parsedArgs, schema)
-				: [];
-			if (typeErrors.length > 0) {
-				const msg = formatValidationError(
-					'one or more arguments have the wrong type — fix the types and call the tool again',
-					typeErrors,
-				);
-				setValidationError(msg);
-				setHasValidationError(true);
-				setFormatterPreview(<Text color={colors.error}>{msg}</Text>);
-				return;
-			}
-
-			// 2. Per-tool validator.
-			const validator = toolManager.getToolValidator(toolCall.function.name);
-			if (validator) {
+				let parsedArgs: Record<string, unknown> = {};
 				try {
-					const validationResult = await validator(parsedArgs);
-					if (!validationResult.valid) {
-						setValidationError(validationResult.error);
-						setHasValidationError(true);
-						setFormatterPreview(
-							<Text color={colors.error}>{validationResult.error}</Text>,
-						);
-						return;
-					}
-				} catch (error) {
-					const logger = getLogger();
-					logger.error({error: formatError(error)}, 'Error running validator');
-					const errorMsg = `Validation error: ${formatError(error)}`;
-					setValidationError(errorMsg);
+					parsedArgs = parseToolArguments(toolCall.function.arguments);
+				} catch {
+					// Leave as {} — the schema/validator will surface the real problem.
+				}
+
+				// 1. Schema type-check — the same check the executed handler runs, so a
+				// wrong-typed argument shows red here and is fed back to the model.
+				const schema = getToolJsonSchema(
+					toolManager.getToolEntry(toolCall.function.name)?.tool,
+				);
+				const typeErrors = schema
+					? validateArgsAgainstSchema(parsedArgs, schema)
+					: [];
+				if (typeErrors.length > 0) {
+					const msg = formatValidationError(
+						'one or more arguments have the wrong type — fix the types and call the tool again',
+						typeErrors,
+					);
 					setHasValidationError(true);
-					setFormatterPreview(<Text color={colors.error}>{errorMsg}</Text>);
+					setFormatterPreview(<Text color={colors.error}>{msg}</Text>);
 					return;
 				}
-			}
 
-			// 3. Formatter preview.
-			const formatter = toolManager.getToolFormatter(toolCall.function.name);
-			if (formatter) {
-				setIsLoadingPreview(true);
-				try {
-					const preview = await formatter(parsedArgs);
-					setFormatterPreview(preview);
-				} catch (error) {
-					const logger = getLogger();
-					logger.error(
-						{error: formatError(error)},
-						'Error loading formatter preview',
-					);
-					setHasFormatterError(true);
-					setFormatterPreview(
-						<Text color={colors.error}>Error: {String(error)}</Text>,
-					);
-				} finally {
-					setIsLoadingPreview(false);
+				// 2. Per-tool validator.
+				const validator = toolManager.getToolValidator(toolCall.function.name);
+				if (validator) {
+					try {
+						const validationResult = await validator(parsedArgs);
+						if (cancelled) return;
+						if (!validationResult.valid) {
+							setHasValidationError(true);
+							setFormatterPreview(
+								<Text color={colors.error}>{validationResult.error}</Text>,
+							);
+							return;
+						}
+					} catch (error) {
+						if (cancelled) return;
+						const logger = getLogger();
+						logger.error(
+							{error: formatError(error)},
+							'Error running validator',
+						);
+						const errorMsg = `Validation error: ${formatError(error)}`;
+						setHasValidationError(true);
+						setFormatterPreview(<Text color={colors.error}>{errorMsg}</Text>);
+						return;
+					}
 				}
+
+				// 3. Formatter preview.
+				const formatter = toolManager.getToolFormatter(toolCall.function.name);
+				if (formatter) {
+					setIsLoadingPreview(true);
+					try {
+						const preview = await formatter(parsedArgs);
+						if (cancelled) return;
+						setFormatterPreview(preview);
+					} catch (error) {
+						if (cancelled) return;
+						const logger = getLogger();
+						logger.error(
+							{error: formatError(error)},
+							'Error loading formatter preview',
+						);
+						setHasFormatterError(true);
+						setFormatterPreview(
+							<Text color={colors.error}>Error: {String(error)}</Text>,
+						);
+					} finally {
+						if (!cancelled) setIsLoadingPreview(false);
+					}
+				}
+			} finally {
+				if (!cancelled) setIsChecking(false);
 			}
 		};
 
 		void loadPreview();
+
+		return () => {
+			cancelled = true;
+		};
 	}, [toolCall, toolManager, colors.error]);
 
 	// Handle escape key to cancel
 	useInput((_inputChar, key) => {
 		if (key.escape) {
-			onCancel();
+			answerOnce(onCancel);
 		}
 	});
 
-	// Auto-handle errors without user interaction
+	// Auto-handle formatter crashes without user interaction. Schema-validation
+	// errors are deliberately NOT auto-resolved: auto-approving would execute the
+	// tool without the user ever seeing the consent prompt. Instead the prompt
+	// renders below together with the validation error, and approving re-runs
+	// the validator so the error is fed back to the model for self-correction.
+	//
+	// Deliberate trade-off: a malformed approval-required call now costs the user
+	// a consent prompt that previously self-resolved silently (auto-execute →
+	// validation error → model correction → one approval for the valid call).
+	// Nothing executes without consent is the requirement; the prompt is the
+	// cost. Revisit only if prompt fatigue becomes measurably worse than the
+	// consent gap it closes.
 	React.useEffect(() => {
 		if (hasFormatterError && !hasValidationError) {
 			// Automatically cancel the tool execution only for formatter crashes
-			onConfirm(false);
+			answerOnce(() => onConfirm(false));
 		}
-		if (hasValidationError) {
-			// Automatically proceed to execution phase where the validator
-			// will fail again and pass the error back to the model to correct
-			onConfirm(true);
-		}
-	}, [hasFormatterError, hasValidationError, onConfirm]);
+	}, [hasFormatterError, hasValidationError, onConfirm, answerOnce]);
 
 	const options: ConfirmationOption[] = [
 		{label: '✓ Yes, execute this tool', value: true},
@@ -156,12 +215,25 @@ export default function ToolConfirmation({
 	];
 
 	const handleSelect = (item: ConfirmationOption) => {
-		onConfirm(item.value);
+		answerOnce(() => onConfirm(item.value));
 	};
 
 	return (
-		<Box width={boxWidth} marginBottom={1}>
+		<TitledBoxWithPreferences
+			title="Tool Approval"
+			width={boxWidth}
+			borderColor={colors.tool}
+			paddingX={2}
+			paddingY={1}
+			marginBottom={1}
+		>
 			<Box flexDirection="column">
+				{isChecking && !isLoadingPreview && (
+					<Box marginBottom={1}>
+						<Text color={colors.secondary}>Checking tool call...</Text>
+					</Box>
+				)}
+
 				{/* Formatter preview */}
 				{isLoadingPreview && (
 					<Box marginBottom={1}>
@@ -183,8 +255,17 @@ export default function ToolConfirmation({
 					</Box>
 				)}
 
-				{/* Only show approval prompt if there's no error */}
-				{!hasFormatterError && !hasValidationError && (
+				{isChecking && (
+					<Box>
+						<Text color={colors.secondary}>Press Escape to cancel</Text>
+					</Box>
+				)}
+
+				{/* Show the approval prompt once every check has settled, unless a
+					formatter crash already auto-cancelled the call. Validation
+					errors render above the prompt so the user sees what is wrong
+					before deciding. */}
+				{!isChecking && !hasFormatterError && (
 					<>
 						<Box marginBottom={1}>
 							<Text color={colors.tool}>
@@ -196,7 +277,7 @@ export default function ToolConfirmation({
 							</Text>
 						</Box>
 
-						<SelectInput items={options} onSelect={handleSelect} />
+						<StyledSelectInput items={options} onSelect={handleSelect} />
 
 						<Box marginTop={1}>
 							<Text color={colors.secondary}>Press Escape to cancel</Text>
@@ -214,6 +295,6 @@ export default function ToolConfirmation({
 					</Box>
 				)}
 			</Box>
-		</Box>
+		</TitledBoxWithPreferences>
 	);
 }

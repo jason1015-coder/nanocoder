@@ -333,6 +333,41 @@ Content`;
 // Multi-line String Tests
 // ============================================================================
 
+test('parseEnhancedFrontmatter keeps inline values that end with > or |', t => {
+	const filePath = join(testDir, 'ends-with-gt.md');
+	const content = `---
+description: Render a <Component>
+aliases: [rc]
+parameters: [name]
+---
+Body {{name}}`;
+
+	writeFileSync(filePath, content, 'utf-8');
+
+	const result = parseCommandFile(filePath);
+
+	t.is(result.metadata.description, 'Render a <Component>');
+	t.deepEqual(result.metadata.aliases, ['rc']);
+	t.deepEqual(result.metadata.parameters, ['name']);
+	t.is(result.content, 'Body {{name}}');
+});
+
+test('parseEnhancedFrontmatter keeps inline values that contain a pipe', t => {
+	const filePath = join(testDir, 'contains-pipe.md');
+	const content = `---
+description: a | b
+aliases: [pipe]
+---
+Content`;
+
+	writeFileSync(filePath, content, 'utf-8');
+
+	const result = parseCommandFile(filePath);
+
+	t.is(result.metadata.description, 'a | b');
+	t.deepEqual(result.metadata.aliases, ['pipe']);
+});
+
 test('parseEnhancedFrontmatter parses multi-line string with pipe', t => {
 	const filePath = join(testDir, 'multiline-pipe.md');
 	const content = `---
@@ -556,6 +591,45 @@ test('substituteTemplateVariables handles variables with special chars', t => {
 	t.is(result, 'Path: /home/user/file.txt');
 });
 
+// A string replacement is a substitution template, so every one of these
+// used to be rewritten on its way to the model. They are ordinary characters
+// in a shell snippet, a regex, a Makefile or a price.
+test('substituteTemplateVariables inserts $-tokens literally', t => {
+	const content = 'Prefix {{args}} Suffix';
+
+	// $& expands to the matched text, i.e. the placeholder itself.
+	t.is(
+		substituteTemplateVariables(content, {args: 'cost $& done'}),
+		'Prefix cost $& done Suffix',
+	);
+	// $' splices everything AFTER the match back into the middle of it.
+	t.is(
+		substituteTemplateVariables(content, {args: "use $' here"}),
+		"Prefix use $' here Suffix",
+	);
+	// $` splices everything BEFORE the match.
+	t.is(
+		substituteTemplateVariables(content, {args: 'use $` here'}),
+		'Prefix use $` here Suffix',
+	);
+	// $$ collapses to a single $.
+	t.is(
+		substituteTemplateVariables(content, {args: 'price $$100'}),
+		'Prefix price $$100 Suffix',
+	);
+});
+
+test('substituteTemplateVariables handles a key containing regex metacharacters', t => {
+	// Parameter names come from author-written frontmatter, so nothing stops
+	// one containing a metacharacter. Unescaped, `a(b` built an invalid
+	// pattern and threw, taking the command down.
+	t.notThrows(() => substituteTemplateVariables('x {{a(b}} y', {'a(b': 'z'}));
+	t.is(substituteTemplateVariables('x {{a(b}} y', {'a(b': 'z'}), 'x z y');
+	// A metacharacter in the key must still match literally, not as a pattern.
+	t.is(substituteTemplateVariables('x {{a.b}} y', {'a.b': 'z'}), 'x z y');
+	t.is(substituteTemplateVariables('x {{axb}} y', {'a.b': 'z'}), 'x {{axb}} y');
+});
+
 test('substituteTemplateVariables handles newlines in values', t => {
 	const content = 'Before\n{{text}}\nAfter';
 	const result = substituteTemplateVariables(content, {
@@ -640,9 +714,10 @@ Content`;
 
 	const result = parseCommandFile(filePath);
 
-	// BOM character prevents frontmatter parsing, so entire file is content
-	// The metadata will be empty since no frontmatter was detected
-	t.true(result.content.includes('Command'));
+	// A leading BOM is stripped before splitting, so the frontmatter block is
+	// recognised and the body no longer contains the marker lines.
+	t.is(result.metadata.description, 'Command');
+	t.is(result.content, 'Content');
 });
 
 test('parseCommandFile handles very long description', t => {

@@ -16,6 +16,7 @@ import type {CustomCommand} from '@/types/commands';
 import type {ToolEntry} from '@/types/core';
 
 export type SkillMemberKind = 'command' | 'agent' | 'tool';
+export type SkillTargetKind = SkillMemberKind | 'skill';
 
 /**
  * Resolved reference to a single skill member. The string form used in YAML
@@ -23,7 +24,7 @@ export type SkillMemberKind = 'command' | 'agent' | 'tool';
  * registrar before subscriptions are dispatched.
  */
 export interface SkillMemberRef {
-	kind: SkillMemberKind;
+	kind: SkillTargetKind;
 	name: string;
 }
 
@@ -76,9 +77,20 @@ export interface FileChangedTrigger extends SkillTriggerBase {
 	eventKinds?: FileChangeEventKind[];
 }
 
+export interface FileAiCommentTrigger extends SkillTriggerBase {
+	kind: 'file.ai-comment';
+	paths?: string[];
+}
+
 export interface ScheduleCronTrigger extends SkillTriggerBase {
 	kind: 'schedule.cron';
 	cron: string;
+}
+
+export interface CiJobFailedTrigger extends SkillTriggerBase {
+	kind: 'ci.job.failed';
+	/** Glob patterns; omitted = every branch the source polls. */
+	branches?: string[];
 }
 
 /**
@@ -86,7 +98,11 @@ export interface ScheduleCronTrigger extends SkillTriggerBase {
  * bundle manifest's `subscribe:` block or a member file's frontmatter).
  * The registrar resolves these into runtime `Subscription` objects.
  */
-export type SkillTrigger = FileChangedTrigger | ScheduleCronTrigger;
+export type SkillTrigger =
+	| FileChangedTrigger
+	| FileAiCommentTrigger
+	| ScheduleCronTrigger
+	| CiJobFailedTrigger;
 
 export interface SkillSource {
 	priority: SkillPriority;

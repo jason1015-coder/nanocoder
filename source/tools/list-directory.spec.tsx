@@ -1,10 +1,16 @@
-import {mkdirSync, rmSync, writeFileSync} from 'node:fs';
+import {mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'ava';
 import {render} from 'ink-testing-library';
 import React from 'react';
 import {themes} from '../config/themes';
 import {ThemeContext} from '../hooks/useTheme';
+import {
+	resetSessionCwd,
+	setProjectRoot,
+	setSessionCwd,
+} from '../services/session-cwd';
 import {listDirectoryTool} from './list-directory';
 
 // ============================================================================
@@ -203,7 +209,7 @@ test.serial('list_directory shows files and directories', async t => {
 	}
 });
 
-test.serial('list_directory shows file sizes', async t => {
+test.serial('list_directory hides file sizes by default', async t => {
 	t.timeout(10000);
 	const originalCwd = process.cwd();
 
@@ -219,11 +225,35 @@ test.serial('list_directory shows file sizes', async t => {
 			{toolCallId: 'test', messages: []},
 		);
 
-		// Should show file size in bytes
-		t.true(result.includes('bytes') || result.includes('1,000'));
+		t.true(result.includes('largefile.txt'));
+		t.false(result.includes('bytes'));
 	} finally {
 		process.chdir(originalCwd);
 		rmSync(join(originalCwd, 'test-listdir-sizes-temp'), {recursive: true, force: true});
+	}
+});
+
+test.serial('list_directory shows file sizes when showSizes=true', async t => {
+	t.timeout(10000);
+	const originalCwd = process.cwd();
+
+	try {
+		const testDir = join(process.cwd(), 'test-listdir-sizes-opt-in-temp');
+		mkdirSync(testDir, {recursive: true});
+		writeFileSync(join(testDir, 'largefile.txt'), 'x'.repeat(1000));
+
+		process.chdir(testDir);
+
+		const result = await listDirectoryTool.tool.execute!(
+			{showSizes: true},
+			{toolCallId: 'test', messages: []},
+		);
+
+		// Should show file size in bytes
+		t.true(result.includes('bytes') || result.includes('1000') || result.includes('1,000'));
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(join(originalCwd, 'test-listdir-sizes-opt-in-temp'), {recursive: true, force: true});
 	}
 });
 
@@ -541,6 +571,63 @@ test.serial('list_directory hides dotfiles by default', async t => {
 	}
 });
 
+test.serial('list_directory hides dotfiles when listing the project root (.)', async t => {
+	t.timeout(10000);
+	const originalCwd = process.cwd();
+
+	try {
+		const testDir = join(process.cwd(), 'test-listdir-hidden-root-temp');
+		mkdirSync(testDir, {recursive: true});
+		writeFileSync(join(testDir, '.hidden'), 'secret');
+		writeFileSync(join(testDir, 'visible.ts'), 'content');
+		writeFileSync(join(testDir, '.env'), 'API_KEY=leak');
+
+		process.chdir(testDir);
+
+		for (const path of [undefined, '.', './']) {
+			const result = await listDirectoryTool.tool.execute!(
+				path === undefined ? {} : {path},
+				{toolCallId: 'test', messages: []},
+			);
+			t.false(result.includes('.hidden'), `path=${path} should hide .hidden`);
+			t.false(result.includes('.env'), `path=${path} should hide .env`);
+			t.true(result.includes('visible.ts'), `path=${path} should list visible.ts`);
+		}
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(join(originalCwd, 'test-listdir-hidden-root-temp'), {recursive: true, force: true});
+	}
+});
+
+test.serial('list_directory hides dotfiles when the project itself sits under a hidden dir', async t => {
+	t.timeout(10000);
+	const originalCwd = process.cwd();
+	const ancestor = join(originalCwd, '.test-listdir-hidden-ancestor-temp');
+
+	try {
+		const projectDir = join(ancestor, 'proj');
+		mkdirSync(projectDir, {recursive: true});
+		writeFileSync(join(projectDir, '.hidden'), 'secret');
+		writeFileSync(join(projectDir, 'visible.ts'), 'content');
+
+		process.chdir(projectDir);
+
+		// Weak models routinely pass absolute paths. The hidden *ancestor*
+		// (`.test-listdir-hidden-ancestor-temp`) must not count as "the caller
+		// asked for a hidden directory".
+		const result = await listDirectoryTool.tool.execute!(
+			{path: process.cwd()},
+			{toolCallId: 'test', messages: []},
+		);
+
+		t.false(result.includes('.hidden'));
+		t.true(result.includes('visible.ts'));
+	} finally {
+		process.chdir(originalCwd);
+		rmSync(ancestor, {recursive: true, force: true});
+	}
+});
+
 test.serial('list_directory showHiddenFiles=true shows dotfiles', async t => {
 	t.timeout(10000);
 	const originalCwd = process.cwd();
@@ -602,6 +689,30 @@ test('list_directory tool does not require confirmation', t => {
 	t.is(listDirectoryTool.approval, undefined);
 });
 
+test.serial(
+	'list_directory applies the project-root .gitignore after a cd into a subdir',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-lsroot-'));
+		try {
+			writeFileSync(join(root, '.gitignore'), '*.log\n');
+			writeFileSync(join(root, 'keep.txt'), '');
+			writeFileSync(join(root, 'skip.log'), '');
+			mkdirSync(join(root, 'sub'));
+			setProjectRoot(root);
+			setSessionCwd(join(root, 'sub')); // shell has cd-ed into a subdir
+			const result = await listDirectoryTool.tool.execute!(
+				{path: root},
+				{toolCallId: 'test', messages: []},
+			);
+			t.true(result.includes('keep.txt'), 'lists non-ignored files');
+			t.false(result.includes('skip.log'), 'root .gitignore still applies');
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+		}
+	},
+);
+
 test('list_directory tool has handler function', t => {
 	t.is(typeof listDirectoryTool.tool.execute, 'function');
 });
@@ -609,3 +720,112 @@ test('list_directory tool has handler function', t => {
 test('list_directory tool has formatter function', t => {
 	t.is(typeof listDirectoryTool.formatter, 'function');
 });
+
+test.serial(
+	'list_directory drops a directory matched by a directory-only ignore pattern',
+	async t => {
+		t.timeout(10000);
+		const originalCwd = process.cwd();
+		const testDir = mkdtempSync(join(tmpdir(), 'listdir-ignore-'));
+		try {
+			mkdirSync(join(testDir, 'hidden'));
+			writeFileSync(join(testDir, 'hidden', 'inside.ts'), 'x');
+			mkdirSync(join(testDir, 'src'));
+			writeFileSync(join(testDir, 'src', 'a.ts'), 'x');
+			writeFileSync(join(testDir, '.nanocoderignore'), 'hidden/\n');
+			process.chdir(testDir);
+
+			const result = await listDirectoryTool.tool.execute!(
+				{},
+				{toolCallId: 'test', messages: []},
+			);
+
+			// `hidden/` matches only the trailing-slash form; the entry used to
+			// list and then read back as an empty directory.
+			t.true(result.includes('src/'));
+			t.false(result.includes('hidden'));
+		} finally {
+			process.chdir(originalCwd);
+			rmSync(testDir, {recursive: true, force: true});
+		}
+	},
+);
+
+// ============================================================================
+// Regression tests: out-of-root absolute path containment (issue #1520)
+// ============================================================================
+
+test.serial(
+	'list_directory rejects an out-of-root absolute path',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-lsroot-'));
+		// A sibling directory outside the project root that the model should
+		// never be able to explore.
+		const outside = mkdtempSync(join(tmpdir(), 'nc-lsoutside-'));
+		try {
+			writeFileSync(join(outside, 'secret.txt'), 'x');
+			mkdirSync(join(root, 'src'));
+			writeFileSync(join(root, 'src', 'a.ts'), 'x');
+			setProjectRoot(root);
+
+			await t.throwsAsync(
+				listDirectoryTool.tool.execute!(
+					{path: outside},
+					{toolCallId: 'test', messages: []},
+				),
+				{message: /within the project directory/},
+			);
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+			rmSync(outside, {recursive: true, force: true});
+		}
+	},
+);
+
+test.serial(
+	'list_directory rejects an absolute path into a dot-directory outside the root',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-lsroot-'));
+		const outside = mkdtempSync(join(tmpdir(), 'nc-lsdot-'));
+		try {
+			mkdirSync(join(outside, '.ssh'));
+			writeFileSync(join(outside, '.ssh', 'id_ed25519'), 'x');
+			setProjectRoot(root);
+
+			await t.throwsAsync(
+				listDirectoryTool.tool.execute!(
+					{path: join(outside, '.ssh')},
+					{toolCallId: 'test', messages: []},
+				),
+				{message: /within the project directory/},
+			);
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+			rmSync(outside, {recursive: true, force: true});
+		}
+	},
+);
+
+test.serial(
+	'list_directory accepts an absolute path inside the project root',
+	async t => {
+		const root = mkdtempSync(join(tmpdir(), 'nc-lsroot-'));
+		try {
+			mkdirSync(join(root, 'src'));
+			writeFileSync(join(root, 'src', 'keep.ts'), 'x');
+			setProjectRoot(root);
+			setSessionCwd(root);
+
+			const result = await listDirectoryTool.tool.execute!(
+				{path: join(root, 'src')},
+				{toolCallId: 'test', messages: []},
+			);
+			t.true(result.includes('keep.ts'), 'in-root absolute path still lists');
+		} finally {
+			resetSessionCwd();
+			rmSync(root, {recursive: true, force: true});
+		}
+	},
+);

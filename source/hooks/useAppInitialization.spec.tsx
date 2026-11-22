@@ -1,6 +1,7 @@
-import {mkdtempSync} from 'node:fs';
+import {mkdtempSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {pathToFileURL} from 'node:url';
 import test from 'ava';
 import {cleanup, render} from 'ink-testing-library';
 import React from 'react';
@@ -14,6 +15,7 @@ const {resetPreferencesCache} = await import('@/config/preferences');
 resetPreferencesCache();
 
 import {CustomCommandLoader} from '@/custom-commands/loader';
+import {getLSPManager, LSPManager, resetLSPManager} from '@/lsp/lsp-manager';
 import type {AIProviderConfig} from '@/types/config';
 import type {
 	LLMClient,
@@ -43,6 +45,7 @@ interface ProbeOverrides {
 	cliModel?: string;
 	nonInteractiveMode?: boolean;
 	customCommandCache?: Map<string, CustomCommand>;
+	isTrusted?: boolean;
 }
 
 let captured: ReturnType<typeof useAppInitialization> | null = null;
@@ -76,17 +79,20 @@ function setup(overrides: ProbeOverrides = {}) {
 		nonInteractiveMode: overrides.nonInteractiveMode,
 	};
 
-	function Probe() {
-		captured = useAppInitialization(props as never);
+	function Probe({isTrusted}: {isTrusted: boolean}) {
+		captured = useAppInitialization({...props, isTrusted} as never);
 		return null;
 	}
 
-	const instance = render(<Probe />);
+	const initialTrust = overrides.isTrusted ?? true;
+	const instance = render(<Probe isTrusted={initialTrust} />);
 	if (!captured) throw new Error('useAppInitialization did not initialize');
 	return {
 		handlers: captured as ReturnType<typeof useAppInitialization>,
 		instance,
 		props,
+		setTrust: (isTrusted: boolean) =>
+			instance.rerender(<Probe isTrusted={isTrusted} />),
 	};
 }
 
@@ -181,4 +187,57 @@ test('loadCustomCommands handles loaders that return undefined', t => {
 
 	t.is(cache.size, 0);
 	t.deepEqual(props.setCustomCommandsCount.calls, [[0]]);
+});
+
+test('untrusted directory initializes nothing on mount', t => {
+	const {props} = setup({isTrusted: false});
+
+	// No tool manager means no MCP spawn, no client means no provider
+	// resolution — nothing has read the untrusted project directory yet.
+	t.is(props.setToolManager.calls.length, 0);
+	t.is(props.setClient.calls.length, 0);
+	t.is(props.setPreferencesLoaded.calls.length, 0);
+	t.is(props.setStartChat.calls.length, 0);
+});
+
+test('confirming trust initializes exactly once', t => {
+	const {props, setTrust} = setup({isTrusted: false});
+	t.is(props.setToolManager.calls.length, 0);
+
+	setTrust(true);
+	t.is(props.setToolManager.calls.length, 1);
+
+	// A later re-render at the same trust value must not initialize again.
+	setTrust(true);
+	t.is(props.setToolManager.calls.length, 1);
+});
+
+test('already-trusted directory initializes on mount', t => {
+	const {props} = setup({isTrusted: true});
+
+	t.is(props.setToolManager.calls.length, 1);
+	t.true(props.setPreferencesLoaded.calls.length > 0);
+});
+
+test.serial('initializeLSPServers encodes the workspace root URI', async t => {
+	const workspace = mkdtempSync(join(tmpdir(), 'nanocoder 中文 #%-'));
+	const originalCwd = process.cwd;
+	const originalInitialize = LSPManager.prototype.initialize;
+	await resetLSPManager();
+	LSPManager.prototype.initialize = async () => [];
+	try {
+		const {handlers} = setup({isTrusted: false});
+		process.cwd = () => workspace;
+		await handlers.initializeLSPServers();
+		const manager = await getLSPManager();
+		t.is(
+			(manager as unknown as {rootUri: string}).rootUri,
+			pathToFileURL(workspace).href,
+		);
+	} finally {
+		process.cwd = originalCwd;
+		LSPManager.prototype.initialize = originalInitialize;
+		await resetLSPManager();
+		rmSync(workspace, {recursive: true, force: true});
+	}
 });

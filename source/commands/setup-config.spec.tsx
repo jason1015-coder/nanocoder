@@ -18,6 +18,7 @@ const MockProviders = ({children}: {children: React.ReactNode}) => {
 	const mockTitleShape = {
 		currentTitleShape: 'pill' as const,
 		setCurrentTitleShape: () => {},
+		commitTitleShape: () => {},
 	};
 
 	return (
@@ -39,7 +40,7 @@ test('setup-config command has correct name', t => {
 
 test('setup-config command has a description', t => {
 	t.truthy(setupConfigCommand.description);
-	t.true(setupConfigCommand.description.includes('editor'));
+	t.true(setupConfigCommand.description.includes('$EDITOR'));
 });
 
 test('setup-config command has a handler function', t => {

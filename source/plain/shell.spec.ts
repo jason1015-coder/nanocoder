@@ -1,6 +1,25 @@
-import test from "ava";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { type ExecutionContext } from "ava";
+import { clearAppConfig, reloadAppConfig } from "@/config/index";
+import {
+	describeProjectTrust,
+	TRUST_FINGERPRINT_VERSION,
+} from "@/config/trust/project-trust";
+import {
+	clearPendingHookContext,
+	resetSessionStartHooks,
+	SESSION_END_HOOK_HANDLER,
+} from "@/services/lifecycle-hooks";
+import { setToolRegistryGetter } from "@/message-handler";
+import { setProjectRoot } from "@/services/session-cwd";
+import type { HooksConfig } from "@/types/config";
+import { TOOL_APPROVAL_REQUIRED_KIND } from "@/constants";
 import type { ToolManager } from "@/tools/tool-manager";
-import type { LLMClient } from "@/types/core";
+import type { DevelopmentMode, LLMClient } from "@/types/core";
+import { notifyError, notifyWarning } from "@/components/message-queue";
+import { ShutdownManager } from "@/utils/shutdown";
 import type { PlainConversationOutcome } from "./conversation.js";
 import { runPlainShell } from "./shell.js";
 import type { RunPlainShellDeps } from "./shell.js";
@@ -8,7 +27,9 @@ import type { RunPlainShellDeps } from "./shell.js";
 // Suppress ANSI so any incidental stderr writes stay readable if inspected.
 process.env.NO_COLOR = "1";
 
-const FAKE_CLIENT = {} as LLMClient;
+const FAKE_CLIENT = {
+	getProviderConfig: () => ({name: "test", type: "openai", models: [], config: {}}),
+} as unknown as LLMClient;
 const FAKE_TOOL_MANAGER = {
 	getAvailableToolNames: () => [],
 	getFilteredTools: () => ({}),
@@ -23,6 +44,10 @@ interface CapturedShutdown {
 
 function makeFakeShutdownManager(captured: CapturedShutdown) {
 	return () => ({
+		// runPlainShell registers its session-end lifecycle hook here; the fake
+		// only has to accept the registration, never run it.
+		register: () => undefined,
+		unregister: () => undefined,
 		gracefulShutdown: async (code: number) => {
 			captured.code = code;
 		},
@@ -93,9 +118,209 @@ function baseDeps(
 	return {
 		loadPreferences: () => ({ trustedDirectories: [] }) as never,
 		savePreferences: () => undefined,
+		artifacts: {
+			cleanupStaleEphemeralSessions: async () => undefined,
+			markEphemeralSession: async () => undefined,
+			deleteSessionArtifacts: async () => undefined,
+		},
+		getShutdownManager: makeFakeShutdownManager({ code: null }),
 		...overrides,
 	};
 }
+
+test.serial("plain shell creates a session for artifact tools", async (t) => {
+	const shutdown: CapturedShutdown = {code: null};
+	const stdout = capturingStdout();
+	let sessionId: string | undefined;
+	let workingDirectory: string | undefined;
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				runPlainConversation: async options => {
+					sessionId = options.sessionId;
+					workingDirectory = options.workingDirectory;
+					return {
+						kind: "success",
+						finalText: "done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					};
+				},
+				getShutdownManager: makeFakeShutdownManager(shutdown),
+			}),
+		});
+	} finally {
+		stdout.restore();
+	}
+
+	t.regex(sessionId ?? "", /^[0-9a-f-]{36}$/);
+	t.is(workingDirectory, process.cwd());
+});
+
+test.serial("a run aborted by a signal still reports and exits with its own code", async (t) => {
+	// A real ShutdownManager, driven the way SIGTERM drives it: the signal
+	// starts a clean shutdown (code 0) while the conversation is in flight, and
+	// runPlainShell's handler aborts the run. The run's "error" report must
+	// still be printed, and its exit code (1) must win over the signal's 0.
+	const manager = new ShutdownManager({timeoutMs: 2000});
+	const originalExit = process.exit;
+	let exitCode: number | undefined;
+	process.exit = ((code?: number) => {
+		exitCode = code ?? 0;
+	}) as typeof process.exit;
+	const stdout = capturingStdout();
+	let signalShutdown: Promise<void> = Promise.resolve();
+	let deletes = 0;
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				// The run's own artifact cleanup is still on disk when the shutdown
+				// handler's cleanup returns, as with real file I/O. The handler must
+				// not let the process exit before the run has reported.
+				artifacts: {
+					cleanupStaleEphemeralSessions: async () => undefined,
+					markEphemeralSession: async () => undefined,
+					deleteSessionArtifacts: async () => {
+						deletes++;
+						if (deletes === 1) await new Promise(resolve => setTimeout(resolve, 50));
+					},
+				},
+				runPlainConversation: async options => {
+					// Let runPlainShell hold the conversation promise, as it does by
+					// the time a real signal arrives.
+					await new Promise<void>(resolve => setImmediate(resolve));
+					signalShutdown = manager.gracefulShutdown(0);
+					await new Promise<void>(resolve => {
+						if (options.abortSignal.aborted) resolve();
+						else options.abortSignal.addEventListener("abort", () => resolve(), {once: true});
+					});
+					return {
+						kind: "error",
+						message: "Aborted",
+						finalText: "",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					};
+				},
+				getShutdownManager: () => manager,
+			}),
+		});
+		await signalShutdown;
+	} finally {
+		stdout.restore();
+		process.exit = originalExit;
+		manager.reset();
+	}
+
+	const report = JSON.parse(stdout.get());
+	t.is(report.kind, "error");
+	t.is(report.message, "Aborted");
+	t.is(report.exitCode, 1);
+	t.is(exitCode, 1);
+});
+
+test.serial("plain shell marks and cleans its ephemeral artifact session", async (t) => {
+	const shutdown: CapturedShutdown = {code: null};
+	const stdout = capturingStdout();
+	const calls: string[] = [];
+	let conversationSessionId = "";
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				runPlainConversation: async options => {
+					conversationSessionId = options.sessionId ?? "";
+					return {
+						kind: "success",
+						finalText: "done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					};
+				},
+				artifacts: {
+					cleanupStaleEphemeralSessions: async () => {
+						calls.push("sweep");
+					},
+					markEphemeralSession: async sessionId => {
+						calls.push(`mark:${sessionId}`);
+					},
+					deleteSessionArtifacts: async sessionId => {
+						calls.push(`delete:${sessionId}`);
+					},
+				},
+				getShutdownManager: makeFakeShutdownManager(shutdown),
+			}),
+		});
+	} finally {
+		stdout.restore();
+	}
+
+	t.deepEqual(calls, [
+		"sweep",
+		`mark:${conversationSessionId}`,
+		`delete:${conversationSessionId}`,
+	]);
+});
+
+test.serial("plain shell reports a conversation that throws and still cleans its ephemeral session", async (t) => {
+	const shutdown: CapturedShutdown = {code: null};
+	const stdout = capturingStdout();
+	let markedSessionId = "";
+	let deletedSessionId = "";
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				runPlainConversation: async () => {
+					throw new Error("conversation failed");
+				},
+				artifacts: {
+					cleanupStaleEphemeralSessions: async () => undefined,
+					markEphemeralSession: async sessionId => {
+						markedSessionId = sessionId;
+					},
+					deleteSessionArtifacts: async sessionId => {
+						deletedSessionId = sessionId;
+					},
+				},
+				getShutdownManager: makeFakeShutdownManager(shutdown),
+			}),
+		});
+	} finally {
+		stdout.restore();
+	}
+
+	// The throw is reported like any other error and exits through graceful
+	// shutdown (which runs session-end), instead of escaping to the CLI.
+	const report = JSON.parse(stdout.get());
+	t.is(report.kind, "error");
+	t.is(report.exitCode, 1);
+	t.is(report.message, "conversation failed");
+	t.is(shutdown.code, 1);
+	t.regex(markedSessionId, /^[0-9a-f-]{36}$/);
+	t.is(deletedSessionId, markedSessionId);
+});
 
 test.serial(
 	"--json success outcome emits a well-formed report with exit code 0",
@@ -115,6 +340,7 @@ test.serial(
 						finalText: "all done",
 						reasoning: null,
 						toolCalls: [],
+						steps: 3,
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
 				}),
@@ -128,7 +354,53 @@ test.serial(
 		t.is(report.exitCode, 0);
 		t.is(report.finalText, "all done");
 		t.deepEqual(report.toolCalls, []);
+		t.is(report.steps, 3);
 		t.deepEqual(report.filesChanged, []);
+		t.is(report.usage, undefined);
+		t.is(shutdown.code, 0);
+	},
+);
+
+test.serial(
+	"--json success outcome includes usage block when present in conversation outcome",
+	async (t) => {
+		const shutdown: CapturedShutdown = { code: null };
+		const stdout = capturingStdout();
+		try {
+			await runPlainShell({
+				prompt: "do the thing",
+				developmentMode: "auto-accept",
+				trustDirectory: true,
+				outputFormat: "json",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: makeFakeRunPlainConversation({
+						kind: "success",
+						finalText: "all done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+						usage: {
+							inputTokens: 500,
+							outputTokens: 100,
+							totalTokens: 600,
+						},
+					}),
+					getShutdownManager: makeFakeShutdownManager(shutdown),
+				}),
+			});
+		} finally {
+			stdout.restore();
+		}
+
+		const report = JSON.parse(stdout.get());
+		t.is(report.kind, "success");
+		t.is(report.exitCode, 0);
+		t.deepEqual(report.usage, {
+			inputTokens: 500,
+			outputTokens: 100,
+			totalTokens: 600,
+		});
 		t.is(shutdown.code, 0);
 	},
 );
@@ -151,6 +423,7 @@ test.serial(
 						message: "model exploded",
 						finalText: "",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -169,7 +442,7 @@ test.serial(
 );
 
 test.serial(
-	"--json tool-approval-required outcome emits exit code 2 and toolNames",
+	"--json tool-approval-required outcome emits exit code 2, toolNames and autoAcceptWouldRun",
 	async (t) => {
 		const shutdown: CapturedShutdown = { code: null };
 		const stdout = capturingStdout();
@@ -182,10 +455,12 @@ test.serial(
 				deps: baseDeps({
 					initializePlain: makeFakeInitializePlain(),
 					runPlainConversation: makeFakeRunPlainConversation({
-						kind: "tool-approval-required",
+						kind: TOOL_APPROVAL_REQUIRED_KIND,
 						toolNames: ["risky_tool"],
+						autoAcceptWouldRun: false,
 						finalText: "",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -196,15 +471,16 @@ test.serial(
 		}
 
 		const report = JSON.parse(stdout.get());
-		t.is(report.kind, "tool-approval-required");
+		t.is(report.kind, TOOL_APPROVAL_REQUIRED_KIND);
 		t.is(report.exitCode, 2);
 		t.deepEqual(report.toolNames, ["risky_tool"]);
+		t.is(report.autoAcceptWouldRun, false);
 		t.is(shutdown.code, 2);
 	},
 );
 
 test.serial(
-	"filesChanged collects paths only from mutating tool calls, deduped",
+	"filesChanged collects paths only from successful mutating tool calls, deduped",
 	async (t) => {
 		const shutdown: CapturedShutdown = { code: null };
 		const stdout = capturingStdout();
@@ -220,22 +496,24 @@ test.serial(
 						kind: "success",
 						finalText: "edited",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [
 							{
-								name: "write_to_file",
+								name: "write_file",
 								arguments: { path: "/repo/a.ts" },
 								result: "ok",
 								error: null,
 							},
 							{
 								// Same path written twice — should be deduped.
-								name: "edit_file",
+								name: "diff_edit",
 								arguments: { path: "/repo/a.ts" },
 								result: "ok",
 								error: null,
 							},
 							{
-								name: "create_file",
+								// write_file accepts file_path as a legacy alias.
+								name: "write_file",
 								arguments: { file_path: "/repo/b.ts" },
 								result: "ok",
 								error: null,
@@ -248,15 +526,31 @@ test.serial(
 								error: null,
 							},
 							{
-								// Mutating tool that failed: still logs result/error
-								// pass-through, but contributes no file since the call
-								// itself errored before any path-bearing args mattered
-								// for this assertion (failure handling is covered by
-								// the isError tests in conversation.spec.ts).
+								// Mutating tool that failed: its result/error still pass
+								// through, but it changed nothing, so no file.
 								name: "string_replace",
 								arguments: { path: "/repo/d.ts" },
 								result: null,
 								error: "failed to apply patch",
+							},
+							{
+								// file_op is a file tool too: a move changes both ends.
+								name: "file_op",
+								arguments: {
+									operation: "move",
+									path: "/repo/e.ts",
+									destination: "/repo/f.ts",
+								},
+								result: "File moved",
+								error: null,
+							},
+							{
+								// A relative path above the cwd the tool accepted is
+								// still a changed file, not dropped.
+								name: "write_file",
+								arguments: { path: "../sibling/g.ts" },
+								result: "ok",
+								error: null,
 							},
 						],
 					}),
@@ -271,9 +565,15 @@ test.serial(
 		t.is(report.kind, "success");
 		t.deepEqual(
 			new Set(report.filesChanged),
-			new Set(["/repo/a.ts", "/repo/b.ts", "/repo/d.ts"]),
+			new Set([
+				"/repo/a.ts",
+				"/repo/b.ts",
+				"/repo/e.ts",
+				"/repo/f.ts",
+				"../sibling/g.ts",
+			]),
 		);
-		t.is(report.filesChanged.length, 3);
+		t.is(report.filesChanged.length, 5);
 
 		const failedCall = report.toolCalls.find(
 			(tc: { name: string }) => tc.name === "string_replace",
@@ -282,6 +582,36 @@ test.serial(
 		t.is(failedCall.error, "failed to apply patch");
 	},
 );
+
+/**
+ * The two bypasses last different lengths of time: the flag covers one run,
+ * the variable saves the directory as trusted (see the persistence test
+ * below). The message has to say so, or a CI job exporting the variable
+ * "for this run" trusts every checkout it touches.
+ */
+function assertTrustBypassWording(
+	t: ExecutionContext,
+	message: string,
+): void {
+	t.true(
+		message.includes("--trust-directory to bypass the disclaimer for this run only"),
+		message,
+	);
+	t.true(
+		message.includes(
+			"NANOCODER_TRUST_DIRECTORY=1 to trust this directory permanently",
+		),
+		message,
+	);
+	// "for this run" belongs to the flag alone: it appears once, before the
+	// variable is mentioned, however the sentences around it are split.
+	const perRun = [...message.matchAll(/for this run/gi)];
+	t.is(perRun.length, 1, message);
+	t.true(
+		(perRun[0]?.index ?? -1) < message.indexOf("NANOCODER_TRUST_DIRECTORY=1"),
+		message,
+	);
+}
 
 test.serial(
 	"untrusted directory short-circuits with exit code 1 and no initializePlain call",
@@ -313,6 +643,8 @@ test.serial(
 		t.is(report.kind, "error");
 		t.is(report.exitCode, 1);
 		t.regex(report.message, /not trusted/i);
+		assertTrustBypassWording(t, report.message);
+		t.is(report.steps, 0);
 		t.is(shutdown.code, 1);
 		t.false(
 			initCalled,
@@ -334,12 +666,21 @@ test.serial(
 				trustDirectory: false,
 				outputFormat: "json",
 				deps: baseDeps({
-					loadPreferences: () => ({ trustedDirectories: [cwd] }) as never,
+					loadPreferences: () =>
+						({
+							trustedDirectories: [
+								{
+									path: cwd,
+									fingerprint: describeProjectTrust(cwd).fingerprint,
+								},
+							],
+						}) as never,
 					initializePlain: makeFakeInitializePlain(),
 					runPlainConversation: makeFakeRunPlainConversation({
 						kind: "success",
 						finalText: "trusted via preferences",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -360,7 +701,11 @@ test.serial(
 	async (t) => {
 		const shutdown: CapturedShutdown = { code: null };
 		const stdout = capturingStdout();
-		let savedWith: { trustedDirectories?: string[] } | null = null;
+		let savedWith: {
+			trustedDirectories?: Array<
+				string | {path: string; fingerprint: string}
+			>;
+		} | null = null;
 		process.env.NANOCODER_TRUST_DIRECTORY = "1";
 		try {
 			await runPlainShell({
@@ -371,13 +716,18 @@ test.serial(
 				deps: baseDeps({
 					loadPreferences: () => ({ trustedDirectories: [] }) as never,
 					savePreferences: (prefs) => {
-						savedWith = prefs as { trustedDirectories?: string[] };
+						savedWith = prefs as {
+							trustedDirectories?: Array<
+								string | {path: string; fingerprint: string}
+							>;
+						};
 					},
 					initializePlain: makeFakeInitializePlain(),
 					runPlainConversation: makeFakeRunPlainConversation({
 						kind: "success",
 						finalText: "trusted via env var",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -392,11 +742,13 @@ test.serial(
 		t.is(report.kind, "success");
 		t.is(shutdown.code, 0);
 		t.truthy(savedWith);
-		t.true(
-			(savedWith?.trustedDirectories ?? []).some(
-				(dir) => dir === process.cwd(),
-			),
-		);
+		t.deepEqual(savedWith?.trustedDirectories, [
+			{
+				path: process.cwd(),
+				fingerprint: describeProjectTrust(process.cwd()).fingerprint,
+				fingerprintVersion: TRUST_FINGERPRINT_VERSION,
+			},
+		]);
 	},
 );
 
@@ -457,6 +809,7 @@ test.serial(
 						kind: "success",
 						finalText: "all done",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -474,6 +827,128 @@ test.serial(
 		t.regex(stderr.get(), /acme-provider/);
 		t.regex(stderr.get(), /acme-model/);
 		t.regex(stderr.get(), /done/);
+		t.is(shutdown.code, 0);
+	},
+);
+
+test.serial(
+	"plain mode appends the persisted plan to the system prompt",
+	async (t) => {
+		const shutdown: CapturedShutdown = {code: null};
+		const stdout = capturingStdout();
+		const stderr = capturingStderr();
+		let systemContent = "";
+		try {
+			await runPlainShell({
+				prompt: "continue the plan",
+				developmentMode: "auto-accept",
+				trustDirectory: true,
+				outputFormat: "text",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: async (options) => {
+						systemContent = String(options.systemMessage.content);
+						return {
+							kind: "success",
+							finalText: "all done",
+							reasoning: null,
+							steps: 1,
+							toolCalls: [],
+						};
+					},
+					getShutdownManager: makeFakeShutdownManager(shutdown),
+					appendActivePlanContext: async (systemPrompt) =>
+						`${systemPrompt}\n\n## ACTIVE PLAN (persisted)\n\n- api`,
+				}),
+			});
+		} finally {
+			stdout.restore();
+			stderr.restore();
+		}
+
+		t.true(systemContent.includes("## ACTIVE PLAN (persisted)"));
+		t.is(shutdown.code, 0);
+	},
+);
+
+test.serial(
+	"text mode recalls relevant project memories and surfaces the count on stderr",
+	async (t) => {
+		const shutdown: CapturedShutdown = { code: null };
+		const stdout = capturingStdout();
+		const stderr = capturingStderr();
+		const calls: Array<{ query: string }> = [];
+		try {
+			await runPlainShell({
+				prompt: "refactor the auth module",
+				developmentMode: "auto-accept",
+				trustDirectory: true,
+				outputFormat: "text",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: makeFakeRunPlainConversation({
+						kind: "success",
+						finalText: "all done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					}),
+					getShutdownManager: makeFakeShutdownManager(shutdown),
+					buildProjectContextSection: async (query) => {
+						calls.push({ query });
+						return {
+							content: "## Project Context\n\n- Auth uses Clerk.",
+							memoryCount: 2,
+						};
+					},
+				}),
+			});
+		} finally {
+			stdout.restore();
+			stderr.restore();
+		}
+
+		t.is(calls.length, 1);
+		t.is(calls[0]?.query, "refactor the auth module");
+		t.regex(stderr.get(), /Recalling 2 project memories\.\.\./);
+		t.is(shutdown.code, 0);
+	},
+);
+
+test.serial(
+	"text mode stays silent when no relevant memories are recalled",
+	async (t) => {
+		const shutdown: CapturedShutdown = { code: null };
+		const stdout = capturingStdout();
+		const stderr = capturingStderr();
+		try {
+			await runPlainShell({
+				prompt: "do the thing",
+				developmentMode: "auto-accept",
+				trustDirectory: true,
+				outputFormat: "text",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: makeFakeRunPlainConversation({
+						kind: "success",
+						finalText: "all done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					}),
+					getShutdownManager: makeFakeShutdownManager(shutdown),
+					buildProjectContextSection: async () => ({
+						content: "",
+						memoryCount: 0,
+					}),
+				}),
+			});
+		} finally {
+			stdout.restore();
+			stderr.restore();
+		}
+
+		t.false(stderr.get().includes("Recalling"));
 		t.is(shutdown.code, 0);
 	},
 );
@@ -497,6 +972,7 @@ test.serial(
 						message: "model exploded",
 						finalText: "",
 						reasoning: null,
+						steps: 1,
 						toolCalls: [],
 					}),
 					getShutdownManager: makeFakeShutdownManager(shutdown),
@@ -512,38 +988,87 @@ test.serial(
 	},
 );
 
+async function runTextApprovalRequired(
+	developmentMode: DevelopmentMode,
+	toolNames: string[],
+	autoAcceptWouldRun: boolean,
+): Promise<{ stderr: string; code: number | null }> {
+	const shutdown: CapturedShutdown = { code: null };
+	const stdout = capturingStdout();
+	const stderr = capturingStderr();
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode,
+			trustDirectory: true,
+			outputFormat: "text",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				runPlainConversation: makeFakeRunPlainConversation({
+					kind: TOOL_APPROVAL_REQUIRED_KIND,
+					toolNames,
+					autoAcceptWouldRun,
+					finalText: "",
+					reasoning: null,
+					steps: 1,
+					toolCalls: [],
+				}),
+				getShutdownManager: makeFakeShutdownManager(shutdown),
+			}),
+		});
+	} finally {
+		stdout.restore();
+		stderr.restore();
+	}
+	return { stderr: stderr.get(), code: shutdown.code };
+}
+
 test.serial(
 	"text tool-approval-required outcome writes guidance to stderr with exit code 2",
 	async (t) => {
-		const shutdown: CapturedShutdown = { code: null };
-		const stdout = capturingStdout();
-		const stderr = capturingStderr();
-		try {
-			await runPlainShell({
-				prompt: "do the thing",
-				developmentMode: "auto-accept",
-				trustDirectory: true,
-				outputFormat: "text",
-				deps: baseDeps({
-					initializePlain: makeFakeInitializePlain(),
-					runPlainConversation: makeFakeRunPlainConversation({
-						kind: "tool-approval-required",
-						toolNames: ["risky_tool"],
-						finalText: "",
-						reasoning: null,
-						toolCalls: [],
-					}),
-					getShutdownManager: makeFakeShutdownManager(shutdown),
-				}),
-			});
-		} finally {
-			stdout.restore();
-			stderr.restore();
-		}
+		const { stderr, code } = await runTextApprovalRequired(
+			"normal",
+			["risky_tool"],
+			true,
+		);
 
-		t.regex(stderr.get(), /Tool approval required for: risky_tool/);
-		t.regex(stderr.get(), /auto-accept|yolo/);
-		t.is(shutdown.code, 2);
+		t.regex(stderr, /Tool approval required for: risky_tool/);
+		t.regex(stderr, /--mode auto-accept or --mode yolo/);
+		t.is(code, 2);
+	},
+);
+
+test.serial(
+	"text tool-approval-required in auto-accept does not suggest --mode auto-accept",
+	async (t) => {
+		const { stderr, code } = await runTextApprovalRequired(
+			"auto-accept",
+			["execute_bash"],
+			false,
+		);
+
+		t.regex(stderr, /Tool approval required for: execute_bash/);
+		t.false(stderr.includes("--mode auto-accept"));
+		t.regex(stderr, /--mode yolo/);
+		t.is(code, 2);
+	},
+);
+
+test.serial(
+	"text tool-approval-required shows alwaysAllow nested under nanocoder",
+	async (t) => {
+		const { stderr } = await runTextApprovalRequired(
+			"auto-accept",
+			["execute_bash", "file_op", "execute_bash"],
+			false,
+		);
+
+		t.true(
+			stderr.includes(
+				'{"nanocoder": {"alwaysAllow": ["execute_bash", "file_op"]}}',
+			),
+		);
+		t.regex(stderr, /Tool approval required for: execute_bash, file_op\./);
 	},
 );
 
@@ -575,6 +1100,7 @@ test.serial(
 		}
 
 		t.regex(stderr.get(), /not trusted/i);
+		assertTrustBypassWording(t, stderr.get());
 		t.is(shutdown.code, 1);
 		t.false(initCalled);
 	},
@@ -606,5 +1132,522 @@ test.serial(
 
 		t.regex(stderr.get(), /no provider configured/);
 		t.is(shutdown.code, 1);
+	},
+);
+
+// ---------------------------------------------------------------------------
+// Lifecycle hooks in the headless shell.
+//
+// `run` / --plain is a session too, so it fires session-start, session-end and
+// user-prompt-submit. None of that is exercised by the TUI's tests, and a veto
+// here has to stop the run before any model call rather than after one.
+// ---------------------------------------------------------------------------
+
+const HOOK_DIR = join(tmpdir(), `nanocoder-plain-hooks-${Date.now()}`);
+
+function withPlainHooks(hooks: HooksConfig): void {
+	writeFileSync(
+		join(HOOK_DIR, "agents.config.json"),
+		JSON.stringify({ nanocoder: { hooks } }),
+		"utf-8",
+	);
+	reloadAppConfig();
+}
+
+// Portable hook bodies: `sh -c` on POSIX, `cmd /c` on Windows.
+const hookNode = (script: string) => `node -e "${script}"`;
+
+test.serial(
+	"plain shell prepends session-start hook output to the prompt",
+	async (t) => {
+		const previousCwd = process.cwd();
+		const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+		mkdirSync(HOOK_DIR, { recursive: true });
+		process.env.NANOCODER_CONFIG_DIR = join(HOOK_DIR, "no-global-config");
+		process.chdir(HOOK_DIR);
+		setProjectRoot(HOOK_DIR);
+		clearPendingHookContext();
+		resetSessionStartHooks();
+
+		const stdout = capturingStdout();
+		let firstUserMessage = "";
+		try {
+			withPlainHooks({
+				"session-start": [{ command: hookNode("console.log('branch: main')") }],
+			});
+			await runPlainShell({
+				prompt: "what changed?",
+				developmentMode: "yolo",
+				trustDirectory: true,
+				outputFormat: "json",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: async (options) => {
+						firstUserMessage = String(
+							options.initialMessages.find((m) => m.role === "user")?.content ?? "",
+						);
+						return {
+							kind: "success",
+							finalText: "done",
+							reasoning: null,
+							steps: 1,
+							toolCalls: [],
+						};
+					},
+					getShutdownManager: makeFakeShutdownManager({ code: null }),
+				}),
+			});
+		} finally {
+			stdout.restore();
+			process.chdir(previousCwd);
+			if (previousConfigDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+			}
+			setProjectRoot(previousCwd);
+			clearAppConfig();
+			clearPendingHookContext();
+			resetSessionStartHooks();
+		}
+
+		t.true(
+			firstUserMessage.startsWith(
+				"<hook-context>\nbranch: main\n</hook-context>\n\n",
+			),
+			`expected the hook context in front of the prompt, got: ${firstUserMessage}`,
+		);
+		t.true(firstUserMessage.endsWith("what changed?"));
+	},
+);
+
+test.serial(
+	"a user-prompt-submit veto stops the run before any model call",
+	async (t) => {
+		const previousCwd = process.cwd();
+		const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+		mkdirSync(HOOK_DIR, { recursive: true });
+		process.env.NANOCODER_CONFIG_DIR = join(HOOK_DIR, "no-global-config");
+		process.chdir(HOOK_DIR);
+		setProjectRoot(HOOK_DIR);
+		clearPendingHookContext();
+		resetSessionStartHooks();
+
+		const shutdown: CapturedShutdown = { code: null };
+		const stdout = capturingStdout();
+		let conversationRan = false;
+		try {
+			withPlainHooks({
+				"user-prompt-submit": [
+					{
+						name: "guard",
+						command: hookNode("console.log('not on a Friday');process.exit(1)"),
+					},
+				],
+			});
+			await runPlainShell({
+				prompt: "ship it",
+				developmentMode: "yolo",
+				trustDirectory: true,
+				outputFormat: "json",
+				deps: baseDeps({
+					initializePlain: makeFakeInitializePlain(),
+					runPlainConversation: async () => {
+						conversationRan = true;
+						return {
+							kind: "success",
+							finalText: "done",
+							reasoning: null,
+							steps: 1,
+							toolCalls: [],
+						};
+					},
+					getShutdownManager: makeFakeShutdownManager(shutdown),
+				}),
+			});
+		} finally {
+			stdout.restore();
+			process.chdir(previousCwd);
+			if (previousConfigDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+			}
+			setProjectRoot(previousCwd);
+			clearAppConfig();
+			clearPendingHookContext();
+			resetSessionStartHooks();
+		}
+
+		t.false(conversationRan, "the model must never be reached");
+		t.is(shutdown.code, 1, "and the run exits non-zero");
+		t.true(
+			stdout.get().includes("not on a Friday"),
+			"the hook's reason is reported",
+		);
+	},
+);
+
+test.serial("plain shell registers a session-end hook handler", async (t) => {
+	const registered: string[] = [];
+	const stdout = capturingStdout();
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain(),
+				runPlainConversation: async () => ({
+					kind: "success",
+					finalText: "done",
+					reasoning: null,
+					steps: 1,
+					toolCalls: [],
+				}),
+				getShutdownManager: () =>
+					({
+						register: (handler: { name: string }) => {
+							registered.push(handler.name);
+						},
+						unregister: () => undefined,
+						gracefulShutdown: async () => undefined,
+					}) as never,
+			}),
+		});
+	} finally {
+		stdout.restore();
+	}
+
+	t.true(
+		registered.includes(SESSION_END_HOOK_HANDLER),
+		`session-end must be registered for every exit path, got: ${registered.join(", ")}`,
+	);
+});
+
+// ---------------------------------------------------------------------------
+// Provider failure after a tool ran
+//
+// client.chat rejects on an HTTP error or a dropped connection. The run still
+// has to print its report, with the tool call that already ran, exit 1, and
+// go through graceful shutdown so session-end fires.
+// ---------------------------------------------------------------------------
+
+// Runs its registered handlers like the real shutdown manager, so a test can
+// see the session-end hook fire.
+function makeRunningShutdownManager(captured: CapturedShutdown) {
+	const handlers = new Map<
+		string,
+		{ name: string; priority: number; handler: () => Promise<void> }
+	>();
+	return () => ({
+		register: (entry: {
+			name: string;
+			priority: number;
+			handler: () => Promise<void>;
+		}) => {
+			handlers.set(entry.name, entry);
+		},
+		unregister: (name: string) => {
+			handlers.delete(name);
+		},
+		gracefulShutdown: async (code: number) => {
+			captured.code = code;
+			const sorted = [...handlers.values()].sort(
+				(a, b) => a.priority - b.priority,
+			);
+			for (const entry of sorted) {
+				await entry.handler();
+			}
+		},
+	});
+}
+
+async function runShellWithFailingProvider(outputFormat: "json" | "text") {
+	const previousCwd = process.cwd();
+	const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+	mkdirSync(HOOK_DIR, { recursive: true });
+	process.env.NANOCODER_CONFIG_DIR = join(HOOK_DIR, "no-global-config");
+	process.chdir(HOOK_DIR);
+	setProjectRoot(HOOK_DIR);
+	clearPendingHookContext();
+	resetSessionStartHooks();
+
+	const hooksLog = join(HOOK_DIR, `session-end-${outputFormat}.log`);
+	rmSync(hooksLog, { force: true });
+
+	// First request: a tool call. Second request: the provider fails.
+	let chatCalls = 0;
+	const client = {
+		getProviderConfig: () => ({ name: "test", type: "openai", models: [], config: {} }),
+		getCurrentModel: () => "fake-model",
+		chat: async () => {
+			chatCalls++;
+			if (chatCalls > 1) {
+				throw new Error("Server error (500): upstream failed");
+			}
+			return {
+				choices: [
+					{
+						message: {
+							role: "assistant",
+							content: "",
+							tool_calls: [
+								{
+									id: "call-1",
+									function: { name: "safe_tool", arguments: { command: "echo hi" } },
+								},
+							],
+						},
+					},
+				],
+			};
+		},
+	} as unknown as LLMClient;
+	const toolManager = {
+		...FAKE_TOOL_MANAGER,
+		getAvailableToolNames: () => ["safe_tool"],
+		getFilteredTools: () => ({ safe_tool: {} }),
+		hasTool: (name: string) => name === "safe_tool",
+		getToolEntry: (name: string) =>
+			name === "safe_tool"
+				? { name, tool: {}, handler: async () => "tool-output", approval: false }
+				: undefined,
+	} as unknown as ToolManager;
+	let toolRuns = 0;
+	setToolRegistryGetter(() => ({
+		safe_tool: (async () => {
+			toolRuns++;
+			return "tool-output";
+		}) as never,
+	}));
+
+	const shutdown: CapturedShutdown = { code: null };
+	const stdout = capturingStdout();
+	const stderr = capturingStderr();
+	try {
+		withPlainHooks({
+			"session-end": [
+				{ command: hookNode(`require('fs').appendFileSync('${hooksLog}', 'end')`) },
+			],
+		});
+		await runPlainShell({
+			prompt: "do it",
+			developmentMode: "yolo",
+			trustDirectory: true,
+			outputFormat,
+			deps: baseDeps({
+				initializePlain: makeFakeInitializePlain({ client, toolManager }),
+				getShutdownManager: makeRunningShutdownManager(shutdown) as never,
+			}),
+		});
+	} finally {
+		stdout.restore();
+		stderr.restore();
+		setToolRegistryGetter(() => ({}));
+		process.chdir(previousCwd);
+		if (previousConfigDir === undefined) {
+			delete process.env.NANOCODER_CONFIG_DIR;
+		} else {
+			process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+		}
+		setProjectRoot(previousCwd);
+		clearAppConfig();
+		clearPendingHookContext();
+		resetSessionStartHooks();
+	}
+
+	return {
+		stdout: stdout.get(),
+		stderr: stderr.get(),
+		exitCode: shutdown.code,
+		toolRuns,
+		sessionEnd: existsSync(hooksLog) ? readFileSync(hooksLog, "utf-8") : "",
+	};
+}
+
+test.serial(
+	"--json: a provider error after a tool call still reports the tool call, exits 1 and runs session-end",
+	async (t) => {
+		const run = await runShellWithFailingProvider("json");
+
+		t.is(run.toolRuns, 1);
+		const report = JSON.parse(run.stdout);
+		t.is(report.kind, "error");
+		t.is(report.exitCode, 1);
+		t.is(report.message, "Server error (500): upstream failed");
+		t.is(report.toolCalls.length, 1);
+		t.is(report.toolCalls[0].name, "safe_tool");
+		t.regex(String(report.toolCalls[0].result), /tool-output/);
+		t.is(run.exitCode, 1);
+		t.is(run.sessionEnd, "end", "session-end must run on the error path");
+	},
+);
+
+test.serial(
+	"text: a provider error after a tool call prints the error, exits 1 and runs session-end",
+	async (t) => {
+		const run = await runShellWithFailingProvider("text");
+
+		t.is(run.toolRuns, 1);
+		t.true(
+			run.stderr.includes("Server error (500): upstream failed"),
+			`expected the provider error on stderr, got: ${run.stderr}`,
+		);
+		t.is(run.exitCode, 1);
+		t.is(run.sessionEnd, "end", "session-end must run on the error path");
+	},
+);
+
+test.serial("plain shell initializes with the run's development mode", async (t) => {
+	const stdout = capturingStdout();
+	let initOptions: { developmentMode?: string } | undefined;
+	try {
+		await runPlainShell({
+			prompt: "do the thing",
+			developmentMode: "plan",
+			trustDirectory: true,
+			outputFormat: "json",
+			deps: baseDeps({
+				initializePlain: async (options) => {
+					initOptions = options;
+					return makeFakeInitializePlain()();
+				},
+				runPlainConversation: async () => ({
+					kind: "success",
+					finalText: "done",
+					reasoning: null,
+					steps: 1,
+					toolCalls: [],
+				}),
+				getShutdownManager: makeFakeShutdownManager({ code: null }),
+			}),
+		});
+	} finally {
+		stdout.restore();
+	}
+
+	// Subagents are built from this, so a plan-mode run can't hand them
+	// the editing tools its own agent is not offered.
+	t.is(initOptions?.developmentMode, "plan");
+});
+
+test.serial(
+	"plain shell captures notifyWarning and notifyError to stderr and includes warnings in json report",
+	async (t) => {
+		const stdout = capturingStdout();
+		const stderr = capturingStderr();
+		try {
+			await runPlainShell({
+				prompt: "test warning capture",
+				developmentMode: "yolo",
+				trustDirectory: true,
+				outputFormat: "json",
+				deps: baseDeps({
+					initializePlain: async () => {
+						notifyWarning("Invalid hooks config: unknown lifecycle event 'post-tool-uze'.");
+						notifyWarning("Invalid formatters config: entries need a 'command' string.");
+						notifyError("Plugin bad.mjs failed to load: boom from plugin");
+						return {
+							client: FAKE_CLIENT,
+							toolManager: FAKE_TOOL_MANAGER,
+							provider: "fake-provider",
+							model: "fake-model",
+						};
+					},
+					runPlainConversation: async () => ({
+						kind: "success",
+						finalText: "done",
+						reasoning: null,
+						steps: 1,
+						toolCalls: [],
+					}),
+				}),
+			});
+		} finally {
+			stdout.restore();
+			stderr.restore();
+		}
+
+		const stderrOutput = stderr.get();
+		t.true(stderrOutput.includes("unknown lifecycle event 'post-tool-uze'"));
+		t.true(stderrOutput.includes("entries need a 'command' string"));
+		t.true(stderrOutput.includes("Plugin bad.mjs failed to load: boom from plugin"));
+
+		const jsonOutput = JSON.parse(stdout.get());
+		t.is(jsonOutput.kind, "success");
+		t.truthy(jsonOutput.warnings);
+		t.is(jsonOutput.warnings.length, 3);
+		t.true(jsonOutput.warnings[0].includes("unknown lifecycle event 'post-tool-uze'"));
+		t.true(jsonOutput.warnings[1].includes("entries need a 'command' string"));
+		t.true(jsonOutput.warnings[2].includes("Plugin bad.mjs failed to load: boom from plugin"));
+	},
+);
+
+test.serial(
+	"plain shell includes collected warnings in prompt-gate-blocked json report",
+	async (t) => {
+		const previousCwd = process.cwd();
+		const previousConfigDir = process.env.NANOCODER_CONFIG_DIR;
+		mkdirSync(HOOK_DIR, { recursive: true });
+		process.env.NANOCODER_CONFIG_DIR = join(HOOK_DIR, "no-global-config");
+		process.chdir(HOOK_DIR);
+		setProjectRoot(HOOK_DIR);
+		clearPendingHookContext();
+		resetSessionStartHooks();
+
+		const stdout = capturingStdout();
+		const stderr = capturingStderr();
+		try {
+			withPlainHooks({
+				"user-prompt-submit": [
+					{
+						name: "veto-guard",
+						command: hookNode("console.log('prompt rejected by policy');process.exit(1)"),
+					},
+				],
+			});
+			await runPlainShell({
+				prompt: "blocked prompt",
+				developmentMode: "yolo",
+				trustDirectory: true,
+				outputFormat: "json",
+				deps: baseDeps({
+					initializePlain: async () => {
+						notifyWarning("Some startup warning");
+						return {
+							client: FAKE_CLIENT,
+							toolManager: FAKE_TOOL_MANAGER,
+							provider: "fake-provider",
+							model: "fake-model",
+						};
+					},
+				}),
+			});
+		} finally {
+			stdout.restore();
+			stderr.restore();
+			process.chdir(previousCwd);
+			if (previousConfigDir === undefined) {
+				delete process.env.NANOCODER_CONFIG_DIR;
+			} else {
+				process.env.NANOCODER_CONFIG_DIR = previousConfigDir;
+			}
+			setProjectRoot(previousCwd);
+			clearAppConfig();
+			clearPendingHookContext();
+			resetSessionStartHooks();
+		}
+
+		const stderrOutput = stderr.get();
+		t.true(stderrOutput.includes("Some startup warning"));
+
+		const jsonOutput = JSON.parse(stdout.get());
+		t.is(jsonOutput.kind, "error");
+		t.truthy(jsonOutput.warnings);
+		t.is(jsonOutput.warnings.length, 1);
+		t.is(jsonOutput.warnings[0], "Some startup warning");
+		t.true(jsonOutput.message.includes("prompt rejected by policy"));
 	},
 );

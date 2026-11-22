@@ -6,7 +6,8 @@
  * Atomicity: writes go to a sibling `*.tmp` file and rename in place, so a
  * partially-written lockfile is never observable.
  *
- * Stale detection: a lockfile pointing at a dead PID is reaped on first
+ * Stale detection: a lockfile pointing at a dead PID, or at an IPC endpoint
+ * nothing listens on (the PID may have been reused), is reaped on first
  * read by any caller that cares (start, status).
  *
  * See `agents/2026-05-20-skills-unification-plan.md` step 19.
@@ -15,37 +16,90 @@
 import {createHash, randomBytes} from 'node:crypto';
 import {existsSync, mkdirSync} from 'node:fs';
 import {readFile, rename, unlink, writeFile} from 'node:fs/promises';
-import {dirname, join} from 'node:path';
+import {createConnection} from 'node:net';
+import {tmpdir} from 'node:os';
+import {dirname, join, posix} from 'node:path';
+import {ensureNanocoderGitignore} from '@/utils/fs/ensure-nanocoder-gitignore';
 
 export interface DaemonLock {
 	pid: number;
 	socketPath: string;
 	startedAt: number;
 	projectRoot: string;
+	/** CI investigation trust level the daemon was started with. Optional:
+	 * absent in lockfiles written by older daemons. */
+	ciTrustLevel?: string;
 }
 
 export function getLockfilePath(projectRoot: string): string {
 	return join(projectRoot, '.nanocoder', 'daemon.json');
 }
 
+/** Short, stable per-project discriminator for socket and pipe names. */
+function projectHash(projectRoot: string): string {
+	return createHash('sha256').update(projectRoot).digest('hex').slice(0, 10);
+}
+
 /**
- * IPC endpoint path. Unix-like: a project-local AF_UNIX socket file. Windows:
- * a named pipe whose name embeds a hash of the project root so multiple
- * projects each get their own pipe namespace. The path is stored verbatim
- * in the lockfile, so clients read it back regardless of platform.
+ * Bytes available in `sockaddr_un.sun_path`. A path of exactly this length
+ * still binds (macOS carries an explicit `sun_len`, Linux tolerates an
+ * unterminated path), so the check downstream is `>`, not `>=`.
  */
-export function getSocketPath(projectRoot: string): string {
-	if (process.platform === 'win32') {
+function sunPathCapacity(platform: string): number {
+	return platform === 'darwin' ? 104 : 108;
+}
+
+/**
+ * Pure resolver behind {@link getSocketPath}. `platform` and `tmpDir` are
+ * parameters rather than reads of `process.platform` / `os.tmpdir()` so every
+ * branch is exercisable from any OS - CI only runs Linux, and the interesting
+ * branches are the macOS and Windows ones.
+ */
+export function resolveSocketPath(
+	projectRoot: string,
+	platform: string,
+	tmpDir: string,
+): string {
+	if (platform === 'win32') {
 		// Node's net.createServer().listen(path) on Windows requires the
 		// `\\.\pipe\` prefix to bind a named pipe. The hash keeps each
 		// project's pipe in its own slot of the global pipe namespace.
-		const hash = createHash('sha256')
-			.update(projectRoot)
-			.digest('hex')
-			.slice(0, 10);
-		return `\\\\.\\pipe\\nanocoder-daemon-${hash}`;
+		return `\\\\.\\pipe\\nanocoder-daemon-${projectHash(projectRoot)}`;
 	}
-	return join(projectRoot, '.nanocoder', 'daemon.sock');
+
+	// posix.join rather than join: on a non-Windows target the separator is
+	// always '/', and this keeps the resolver honest when `platform` is
+	// injected by a test running on Windows.
+	const projectSock = posix.join(projectRoot, '.nanocoder', 'daemon.sock');
+	const capacity = sunPathCapacity(platform);
+	if (Buffer.byteLength(projectSock) <= capacity) return projectSock;
+
+	// Over capacity, libuv does not fail - it silently truncates the path to
+	// `capacity` bytes. The daemon then reports a socket it never bound, its
+	// own stale-socket cleanup misses the real file, and two projects sharing
+	// a `capacity`-byte prefix collide on one socket. So the moment the
+	// project-local path is too long we stop carrying the unbounded
+	// projectRoot into the socket name at all, and hash it instead.
+	const name = `nanocoder-daemon-${projectHash(projectRoot)}.sock`;
+	const tmpSock = posix.join(tmpDir, name);
+	if (Buffer.byteLength(tmpSock) <= capacity) return tmpSock;
+
+	// A long TMPDIR can push even the hashed name over the limit, which would
+	// put us right back in truncation territory. `/tmp` plus a fixed-length
+	// name is 37 bytes, so this last resort always fits.
+	return posix.join('/tmp', name);
+}
+
+/**
+ * IPC endpoint path. Unix-like: a project-local AF_UNIX socket file, or a
+ * hashed name under the temp dir when the project-local path would exceed
+ * `sockaddr_un.sun_path`. Windows: a named pipe whose name embeds a hash of
+ * the project root so multiple projects each get their own pipe namespace.
+ * The path is stored verbatim in the lockfile, so clients read it back
+ * regardless of platform.
+ */
+export function getSocketPath(projectRoot: string): string {
+	return resolveSocketPath(projectRoot, process.platform, tmpdir());
 }
 
 export async function readLockfile(
@@ -70,9 +124,13 @@ export async function readLockfile(
 }
 
 export async function writeLockfile(lock: DaemonLock): Promise<void> {
+	await ensureNanocoderGitignore(lock.projectRoot);
+
 	const path = getLockfilePath(lock.projectRoot);
 	mkdirSync(dirname(path), {recursive: true});
+
 	const tmp = `${path}.${randomBytes(8).toString('hex')}.tmp`;
+
 	await writeFile(tmp, JSON.stringify(lock, null, 2), 'utf-8');
 	await rename(tmp, path);
 }
@@ -105,16 +163,51 @@ export function isProcessAlive(pid: number): boolean {
 }
 
 /**
+ * Is the daemon's IPC endpoint gone? A recycled PID says nothing about the
+ * daemon, but the endpoint is per project. Only a missing or refused endpoint
+ * proves the lockfile is stale; a timeout or any other error is "unknown" and
+ * must not be read as "gone".
+ */
+function isIpcEndpointGone(
+	socketPath: string,
+	timeoutMs = 1000,
+): Promise<boolean> {
+	return new Promise(resolve => {
+		const socket = createConnection(socketPath);
+		const finish = (gone: boolean) => {
+			clearTimeout(timer);
+			socket.destroy();
+			resolve(gone);
+		};
+		const timer = setTimeout(() => finish(false), timeoutMs);
+		socket.once('connect', () => finish(false));
+		socket.once('error', err => {
+			const code = (err as NodeJS.ErrnoException).code;
+			finish(code === 'ENOENT' || code === 'ECONNREFUSED');
+		});
+	});
+}
+
+/**
  * Read the lockfile and verify the daemon is actually running. Removes
  * stale lockfiles as a side effect so subsequent `daemon start` calls
  * have a clean slate.
+ *
+ * A live PID alone is not enough, because the OS reuses PIDs after a crash
+ * or reboot: the IPC endpoint must still exist too. `verifyIpc: false`
+ * checks the PID only, for callers waiting on a daemon that is shutting
+ * down (its endpoint closes before the process exits).
  */
 export async function readLiveLockfile(
 	projectRoot: string,
+	{verifyIpc = true}: {verifyIpc?: boolean} = {},
 ): Promise<DaemonLock | null> {
 	const lock = await readLockfile(projectRoot);
 	if (!lock) return null;
-	if (!isProcessAlive(lock.pid)) {
+	if (
+		!isProcessAlive(lock.pid) ||
+		(verifyIpc && (await isIpcEndpointGone(lock.socketPath)))
+	) {
 		await removeLockfile(projectRoot);
 		return null;
 	}

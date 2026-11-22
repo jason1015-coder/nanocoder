@@ -1,6 +1,7 @@
 import {mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises';
+import {createServer} from 'node:net';
 import {tmpdir} from 'node:os';
-import {join} from 'node:path';
+import {join, posix} from 'node:path';
 import test from 'ava';
 import {
 	getLockfilePath,
@@ -9,6 +10,7 @@ import {
 	readLiveLockfile,
 	readLockfile,
 	removeLockfile,
+	resolveSocketPath,
 	writeLockfile,
 } from './lockfile';
 
@@ -109,17 +111,56 @@ test.serial('readLiveLockfile reaps stale lockfiles', async t => {
 	}
 });
 
-test.serial('readLiveLockfile returns the lock when process is alive', async t => {
+test.serial('readLiveLockfile returns the lock when process is alive and its socket is listening', async t => {
 	const root = await tempProject();
+	const socketPath = getSocketPath(root);
+	const server = createServer();
+	await new Promise<void>(resolve => server.listen(socketPath, resolve));
 	try {
 		await writeLockfile({
 			pid: process.pid,
-			socketPath: 's',
+			socketPath,
 			startedAt: 1,
 			projectRoot: root,
 		});
 		const live = await readLiveLockfile(root);
 		t.is(live?.pid, process.pid);
+	} finally {
+		await new Promise(resolve => server.close(resolve));
+		await rm(root, {recursive: true, force: true});
+	}
+});
+
+// The OS reuses pids after a crash or reboot, so a live pid alone proves
+// nothing: the daemon's IPC endpoint has to exist too.
+test.serial('readLiveLockfile reaps a lockfile whose pid is alive but whose socket is gone', async t => {
+	const root = await tempProject();
+	try {
+		await writeLockfile({
+			pid: process.pid,
+			socketPath: getSocketPath(root),
+			startedAt: 1,
+			projectRoot: root,
+		});
+		t.is(await readLiveLockfile(root), null);
+		t.is(await readLockfile(root), null);
+	} finally {
+		await rm(root, {recursive: true, force: true});
+	}
+});
+
+test.serial('readLiveLockfile with verifyIpc false only checks the pid', async t => {
+	const root = await tempProject();
+	try {
+		await writeLockfile({
+			pid: process.pid,
+			socketPath: getSocketPath(root),
+			startedAt: 1,
+			projectRoot: root,
+		});
+		const live = await readLiveLockfile(root, {verifyIpc: false});
+		t.is(live?.pid, process.pid);
+		t.truthy(await readLockfile(root));
 	} finally {
 		await rm(root, {recursive: true, force: true});
 	}
@@ -133,6 +174,86 @@ test('getSocketPath returns a project-local .sock file on non-Windows', t => {
 	const root = '/tmp/example-proj';
 	const sock = getSocketPath(root);
 	t.is(sock, join(root, '.nanocoder', 'daemon.sock'));
+});
+
+/**
+ * `<root>/.nanocoder/daemon.sock` adds 23 bytes, so a root that is itself
+ * well within the limit can still produce an overlong socket path. Builds a
+ * root whose *final socket path* is exactly `bytes` long.
+ */
+function rootForSocketBytes(bytes: number): string {
+	return `/tmp/${'a'.repeat(bytes - 23 - 5)}`;
+}
+
+const TMP = '/var/folders/ab/cdefghijklmnopqrstuvwxyz012345/T';
+
+test('resolveSocketPath keeps the project-local socket at exactly sun_path capacity', t => {
+	const darwinRoot = rootForSocketBytes(104);
+	const darwinSock = resolveSocketPath(darwinRoot, 'darwin', TMP);
+	t.is(Buffer.byteLength(darwinSock), 104);
+	t.is(darwinSock, posix.join(darwinRoot, '.nanocoder', 'daemon.sock'));
+
+	const linuxRoot = rootForSocketBytes(108);
+	const linuxSock = resolveSocketPath(linuxRoot, 'linux', TMP);
+	t.is(Buffer.byteLength(linuxSock), 108);
+	t.is(linuxSock, posix.join(linuxRoot, '.nanocoder', 'daemon.sock'));
+});
+
+test('resolveSocketPath falls back to the temp dir one byte over capacity', t => {
+	const root = rootForSocketBytes(105);
+	const sock = resolveSocketPath(root, 'darwin', TMP);
+	t.true(sock.startsWith(`${TMP}/`));
+	t.regex(sock, /nanocoder-daemon-[a-f0-9]{10}\.sock$/);
+	t.true(Buffer.byteLength(sock) <= 104);
+});
+
+test('resolveSocketPath applies the platform-specific capacity', t => {
+	// 108 bytes: over macOS' limit, exactly at Linux'. The same project root
+	// must therefore resolve differently on the two platforms.
+	const root = rootForSocketBytes(108);
+	const projectSock = posix.join(root, '.nanocoder', 'daemon.sock');
+	t.not(resolveSocketPath(root, 'darwin', TMP), projectSock);
+	t.is(resolveSocketPath(root, 'linux', TMP), projectSock);
+
+	// Past 108 both platforms fall back.
+	const longer = rootForSocketBytes(109);
+	t.not(
+		resolveSocketPath(longer, 'linux', TMP),
+		posix.join(longer, '.nanocoder', 'daemon.sock'),
+	);
+});
+
+test('resolveSocketPath falls back to /tmp when the temp dir is itself too long', t => {
+	const longTmp = `/${'x'.repeat(100)}`;
+	const sock = resolveSocketPath(rootForSocketBytes(200), 'darwin', longTmp);
+	t.regex(sock, /^\/tmp\/nanocoder-daemon-[a-f0-9]{10}\.sock$/);
+	t.true(Buffer.byteLength(sock) <= 104);
+});
+
+test('resolveSocketPath fallbacks are stable and per-project', t => {
+	const a = rootForSocketBytes(200);
+	const b = `${a}-other`;
+	t.is(resolveSocketPath(a, 'darwin', TMP), resolveSocketPath(a, 'darwin', TMP));
+	t.not(resolveSocketPath(a, 'darwin', TMP), resolveSocketPath(b, 'darwin', TMP));
+});
+
+test('resolveSocketPath returns a named pipe on Windows regardless of length', t => {
+	const a = resolveSocketPath(`C:\\projects\\${'x'.repeat(300)}`, 'win32', TMP);
+	const b = resolveSocketPath('C:\\projects\\beta', 'win32', TMP);
+	t.regex(a, /^\\\\\.\\pipe\\nanocoder-daemon-[a-f0-9]{10}$/);
+	t.not(a, b, 'distinct project roots produce distinct pipes');
+});
+
+test('getSocketPath falls back off the project dir for overlong paths', t => {
+	if (process.platform === 'win32') {
+		t.pass('skipped: non-Windows-only assertion');
+		return;
+	}
+	const root = rootForSocketBytes(200);
+	const sock = getSocketPath(root);
+	t.not(sock, join(root, '.nanocoder', 'daemon.sock'));
+	t.true(sock.startsWith(tmpdir()) || sock.startsWith('/tmp/'));
+	t.regex(sock, /nanocoder-daemon-[a-f0-9]{10}\.sock$/);
 });
 
 test('getSocketPath returns a named pipe path on Windows', t => {

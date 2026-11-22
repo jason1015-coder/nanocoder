@@ -5,10 +5,18 @@ import {
 	PASTE_LARGE_CONTENT_THRESHOLD_CHARS,
 	PASTE_RAPID_DETECTION_MS,
 } from '@/constants';
+import {handleAtomicDeletion} from '../input/atomic-deletion';
+import {PasteDetector} from '../input/paste-detection';
+import {handlePaste, resizePasteDisplayText} from '../input/paste-utils';
+import {findPlaceholderOccurrences} from '../input/placeholders';
 import {InputState, PlaceholderType} from '../types/hooks';
-import {handleAtomicDeletion} from '../utils/atomic-deletion';
-import {PasteDetector} from '../utils/paste-detection';
-import {handlePaste} from '../utils/paste-utils';
+
+// Cap both undo and redo stacks so a long composition can't grow them
+// unbounded. Every keystroke/paste pushes one entry, and each entry holds a
+// full InputState — without a ceiling the arrays (and their copies) grow
+// linearly with input length. 100 steps is far beyond any realistic undo depth
+// while keeping memory bounded.
+export const MAX_UNDO_STACK = 100;
 
 // Scales the paste window size based on content length.
 // Prevents truncation on slow terminals while keeping small pastes snappy
@@ -29,14 +37,146 @@ function createEmptyInputState(): InputState {
 	};
 }
 
+// Length of the common prefix of `a` and `b`, and of the common suffix that
+// does not overlap it: together they locate the one region `a` -> `b` changed.
+function diffBounds(a: string, b: string): {start: number; suffix: number} {
+	let start = 0;
+	const max = Math.min(a.length, b.length);
+	while (start < max && a[start] === b[start]) start++;
+	let suffix = 0;
+	while (
+		suffix < max - start &&
+		a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+	) {
+		suffix++;
+	}
+	return {start, suffix};
+}
+
+/**
+ * TextInput builds each value it reports from the value it last rendered
+ * (plus its own edits since). When something changes the input out of band
+ * before the next render - a bracketed paste, an undo - that report is based
+ * on a stale value, and committing it as-is erases the change. Replay the
+ * edit TextInput made (`base` -> `edited`) onto `latest` instead, for
+ * insertions and deletions alike.
+ *
+ * An edit at the exact spot the out-of-band change inserted text goes after
+ * it: that is where the cursor sits once the paste is shown.
+ */
+export function reconcileStaleEdit(
+	base: string,
+	edited: string,
+	latest: string,
+): string {
+	if (base === latest) return edited;
+
+	const edit = diffBounds(base, edited);
+	const editEnd = base.length - edit.suffix;
+	const inserted = edited.slice(edit.start, edited.length - edit.suffix);
+
+	// Where base -> latest changed: base[changeStart, changeEnd) became
+	// latest[changeStart, latestChangeEnd).
+	const change = diffBounds(base, latest);
+	const changeStart = change.start;
+	const changeEnd = base.length - change.suffix;
+	const latestChangeEnd = latest.length - change.suffix;
+
+	// Map a base offset into latest. `after` decides which side of the
+	// out-of-band change an offset right at it lands on.
+	const map = (offset: number, after: boolean): number => {
+		if (offset < changeStart) return offset;
+		if (offset > changeEnd) return offset + latestChangeEnd - changeEnd;
+		if (changeStart === changeEnd) {
+			return after ? latestChangeEnd : changeStart;
+		}
+		if (offset === changeStart) return changeStart;
+		// At or inside a region the out-of-band change replaced: whatever the
+		// edit touched there is gone, so land at its end.
+		return latestChangeEnd;
+	};
+
+	const start = map(edit.start, true);
+	const end = Math.max(start, map(editEnd, false));
+	return latest.slice(0, start) + inserted + latest.slice(end);
+}
+
+/**
+ * The input and its edit history. One value, so every transition replaces
+ * all three together and nothing can be updated without the others.
+ */
+export interface EditorState {
+	current: InputState;
+	undo: InputState[];
+	redo: InputState[];
+}
+
+function pushCapped(stack: InputState[], entry: InputState): InputState[] {
+	return stack.length >= MAX_UNDO_STACK
+		? [...stack.slice(-(MAX_UNDO_STACK - 1)), entry]
+		: [...stack, entry];
+}
+
+/** An edit: the old input goes on the undo stack and redo is cleared. */
+export function applyEdit(state: EditorState, next: InputState): EditorState {
+	return {current: next, undo: pushCapped(state.undo, state.current), redo: []};
+}
+
+/** Step back one edit. Returns `state` itself when there is nothing to undo. */
+export function applyUndo(state: EditorState): EditorState {
+	const previous = state.undo.at(-1);
+	if (!previous) return state;
+	return {
+		current: previous,
+		undo: state.undo.slice(0, -1),
+		redo: pushCapped(state.redo, state.current),
+	};
+}
+
+/** Re-apply one undone edit. Returns `state` itself when there is none. */
+export function applyRedo(state: EditorState): EditorState {
+	const next = state.redo.at(-1);
+	if (!next) return state;
+	return {
+		current: next,
+		undo: pushCapped(state.undo, state.current),
+		redo: state.redo.slice(0, -1),
+	};
+}
+
+function emptyEditorState(): EditorState {
+	return {current: createEmptyInputState(), undo: [], redo: []};
+}
+
 export function useInputState() {
-	// Core state following the spec
-	const [currentState, setCurrentState] = useState<InputState>(
-		createEmptyInputState(),
+	// The editor state lives in one ref, the only source of truth. Callbacks
+	// read and write it synchronously, so several events in one stdin batch
+	// (Ink doesn't re-render between them) each see the previous one's
+	// result. `snapshot` is the copy React renders; commit() is the only
+	// writer and updates both together, so they can't drift apart.
+	const storeRef = useRef<EditorState>(emptyEditorState());
+	const [snapshot, setSnapshot] = useState(storeRef.current);
+	const commit = useCallback((next: EditorState) => {
+		storeRef.current = next;
+		setSnapshot(next);
+	}, []);
+	const currentState = snapshot.current;
+	// Read-only view of the latest input, ahead of a re-render.
+	const currentStateRef = useMemo<{readonly current: InputState}>(
+		() => ({
+			get current() {
+				return storeRef.current.current;
+			},
+		}),
+		[],
 	);
 
-	const [undoStack, setUndoStack] = useState<InputState[]>([]);
-	const [redoStack, setRedoStack] = useState<InputState[]>([]);
+	// The value TextInput builds its next report from: what it was last
+	// rendered with, then each value it has reported since. Written during
+	// render, the same way TextInput tracks it, so updateInput can tell when
+	// that report is based on a value the input no longer holds.
+	const textInputValueRef = useRef(currentState.displayValue);
+	textInputValueRef.current = currentState.displayValue;
 
 	// Legacy compatibility - these are derived from currentState
 	const [historyIndex, setHistoryIndex] = useState(-1);
@@ -54,19 +194,32 @@ export function useInputState() {
 	// Cached line count for performance
 	const [cachedLineCount, setCachedLineCount] = useState(1);
 
-	// Helper to push current state to undo stack
+	// Record an edit. Reads the previous input from the store at call time, so
+	// several edits in one stdin batch each record the right predecessor.
 	const pushToUndoStack = useCallback(
 		(newState: InputState) => {
-			setUndoStack(prev => [...prev, currentState]);
-			setRedoStack([]); // Clear redo stack on new action
-			setCurrentState(newState);
+			commit(applyEdit(storeRef.current, newState));
 		},
-		[currentState],
+		[commit],
 	);
 
 	// Update input with paste detection and atomic deletion
+	//
+	// Reads state from the store (the synchronous source of truth) rather
+	// than the closure value so that a burst of updateInput calls within one
+	// stdin batch each see the newest committed state (undo/redo fix #4).
 	const updateInput = useCallback(
-		(newInput: string) => {
+		(reportedInput: string) => {
+			const currentState = storeRef.current.current;
+			// TextInput's report may be built on a value that a paste (or undo)
+			// has since replaced; carry its edit over to the current value.
+			const newInput = reconcileStaleEdit(
+				textInputValueRef.current,
+				reportedInput,
+				currentState.displayValue,
+			);
+			textInputValueRef.current = reportedInput;
+
 			// First, check for atomic deletion (placeholder removal)
 			const atomicDeletionResult = handleAtomicDeletion(currentState, newInput);
 			if (atomicDeletionResult) {
@@ -105,7 +258,10 @@ export function useInputState() {
 					// Merge the new chunk into the existing paste placeholder
 					const updatedContent = placeholder.content + addedChunk;
 					const oldPlaceholder = placeholder.displayText;
-					const newPlaceholder = `[Paste #${lastPasteIdRef.current}: ${updatedContent.length} chars]`;
+					const newPlaceholder = resizePasteDisplayText(
+						oldPlaceholder,
+						updatedContent,
+					);
 
 					const updatedPlaceholderContent = {
 						...currentState.placeholderContent,
@@ -118,7 +274,7 @@ export function useInputState() {
 					};
 
 					// Replace old placeholder with updated one in display value
-					const newDisplayValue = currentState.displayValue.replace(
+					const newDisplayValue = currentState.displayValue.replaceAll(
 						oldPlaceholder,
 						newPlaceholder,
 					);
@@ -169,7 +325,10 @@ export function useInputState() {
 					if (placeholder.type === PlaceholderType.PASTE) {
 						const updatedContent = placeholder.content + detection.addedText;
 						const oldPlaceholder = placeholder.displayText;
-						const newPlaceholder = `[Paste #${activePasteId}: ${updatedContent.length} chars]`;
+						const newPlaceholder = resizePasteDisplayText(
+							oldPlaceholder,
+							updatedContent,
+						);
 
 						const updatedPlaceholderContent = {
 							...currentState.placeholderContent,
@@ -181,7 +340,7 @@ export function useInputState() {
 							},
 						};
 
-						const newDisplayValue = currentState.displayValue.replace(
+						const newDisplayValue = currentState.displayValue.replaceAll(
 							oldPlaceholder,
 							newPlaceholder,
 						);
@@ -255,55 +414,114 @@ export function useInputState() {
 				);
 			}, 50);
 		},
-		[currentState, pushToUndoStack],
+		[pushToUndoStack],
 	);
 
-	// Undo function (Ctrl+_)
+	// Insert a paste the terminal told us about (bracketed paste, DECSET
+	// 2004). This bypasses updateInput's heuristics entirely: the payload
+	// never reached the keypress parser, so there is nothing to guess at
+	// and no risk of a pasted newline having submitted the prompt first.
+	//
+	// When `cursorOffset` is supplied (the caller read it off TextInput
+	// before the paste fired) the pasted text lands at the caret, not at the
+	// end of the value. The function then returns the new caret offset so
+	// the caller can place the cursor after the splice. Returns `null` when
+	// nothing was inserted (empty payload) or when no cursor was supplied —
+	// in the latter case the legacy "append and remount TextInput" path takes
+	// over in the caller.
+	const insertPaste = useCallback(
+		(
+			pastedText: string,
+			cursorOffset?: number,
+		): {cursorOffset: number} | null => {
+			if (!pastedText) {
+				return null;
+			}
+
+			// The ref, not the render-time state: a paste can land in the same
+			// stdin batch as keys typed just before it.
+			const currentState = storeRef.current.current;
+			const pasteResult = handlePaste(
+				pastedText,
+				currentState.displayValue,
+				currentState.placeholderContent,
+				'bracketed',
+				cursorOffset,
+			);
+
+			if (!pasteResult) {
+				// Short single-line paste with no cursor supplied — the legacy
+				// path: just append. The caller remounts TextInput so the caret
+				// jumps to end-of-value.
+				const appended = currentState.displayValue + pastedText;
+				pushToUndoStack({
+					displayValue: appended,
+					placeholderContent: currentState.placeholderContent,
+				});
+				pasteDetectorRef.current.updateState(appended);
+				return null;
+			}
+
+			pushToUndoStack(pasteResult);
+			pasteDetectorRef.current.updateState(pasteResult.displayValue);
+
+			if (cursorOffset === undefined) {
+				return null;
+			}
+
+			// With a cursor, the caller hands TextInput the pasted value along
+			// with the new caret, so TextInput's next report builds on it.
+			textInputValueRef.current = pasteResult.displayValue;
+
+			// Place the caret at the end of whatever was spliced in. The delta
+			// is the same whether the splice inserted the raw payload (short
+			// paste) or a placeholder label (long paste) — we just measure the
+			// resulting string.
+			const delta =
+				pasteResult.displayValue.length - currentState.displayValue.length;
+			return {cursorOffset: cursorOffset + delta};
+		},
+		[pushToUndoStack],
+	);
+
+	// Undo (Ctrl+Z) / redo (Ctrl+Y). Both read the store at call time, so two
+	// presses in one stdin batch each step once. Both stacks are capped at
+	// MAX_UNDO_STACK, so a long undo or redo streak can't grow the other one.
 	const undo = useCallback(() => {
-		if (undoStack.length > 0) {
-			const previousState = undoStack[undoStack.length - 1];
-			const newUndoStack = undoStack.slice(0, -1);
+		const next = applyUndo(storeRef.current);
+		if (next === storeRef.current) return;
+		commit(next);
+		pasteDetectorRef.current.updateState(next.current.displayValue);
+	}, [commit]);
 
-			setRedoStack(prev => [...prev, currentState]);
-			setUndoStack(newUndoStack);
-			setCurrentState(previousState);
-
-			// Update paste detector state
-			pasteDetectorRef.current.updateState(previousState.displayValue);
-		}
-	}, [undoStack, currentState]);
-
-	// Redo function (Ctrl+Y)
 	const redo = useCallback(() => {
-		if (redoStack.length > 0) {
-			const nextState = redoStack[redoStack.length - 1];
-			const newRedoStack = redoStack.slice(0, -1);
-
-			setUndoStack(prev => [...prev, currentState]);
-			setRedoStack(newRedoStack);
-			setCurrentState(nextState);
-
-			// Update paste detector state
-			pasteDetectorRef.current.updateState(nextState.displayValue);
-		}
-	}, [redoStack, currentState]);
+		const next = applyRedo(storeRef.current);
+		if (next === storeRef.current) return;
+		commit(next);
+		pasteDetectorRef.current.updateState(next.current.displayValue);
+	}, [commit]);
 
 	// Delete placeholder atomically
 	const deletePlaceholder = useCallback(
 		(placeholderId: string) => {
-			// Sanitize placeholderId to ensure it only contains safe characters
-			const sanitizedPlaceholderId = placeholderId.replace(
-				/[^a-zA-Z0-9_-]/g,
-				'',
-			);
-			const placeholderPattern = `[Paste #${sanitizedPlaceholderId}: \\d+ chars]`;
-			/* nosemgrep */
-			const regex = new RegExp(
-				placeholderPattern.replace(/[[\]]/g, '\\$&'),
-				'g',
-			);
+			if (!currentState.placeholderContent[placeholderId]) {
+				return;
+			}
 
-			const newDisplayValue = currentState.displayValue.replace(regex, '');
+			// Locate every occurrence by its display text rather than rebuilding a
+			// pattern from the id: ids are namespaced keys, not display labels.
+			const occurrences = findPlaceholderOccurrences(
+				currentState.displayValue,
+				currentState.placeholderContent,
+			).filter(candidate => candidate.id === placeholderId);
+
+			let newDisplayValue = currentState.displayValue;
+			for (let i = occurrences.length - 1; i >= 0; i--) {
+				const {start, end} = occurrences[i];
+				newDisplayValue =
+					newDisplayValue.slice(0, start) + newDisplayValue.slice(end);
+			}
+
 			const newPlaceholderContent = {...currentState.placeholderContent};
 			delete newPlaceholderContent[placeholderId];
 
@@ -322,9 +540,9 @@ export function useInputState() {
 			debounceTimerRef.current = null;
 		}
 
-		setCurrentState(createEmptyInputState());
-		setUndoStack([]);
-		setRedoStack([]);
+		// Through the store, so a key typed before the next render builds on
+		// the empty input rather than on what was just submitted.
+		commit(emptyEditorState());
 		setHasLargeContent(false);
 		setOriginalInput('');
 		setHistoryIndex(-1);
@@ -332,7 +550,7 @@ export function useInputState() {
 		pasteDetectorRef.current.reset();
 		lastPasteTimeRef.current = 0;
 		lastPasteIdRef.current = null;
-	}, []);
+	}, [commit]);
 
 	// Cleanup on unmount
 	useEffect(() => {
@@ -344,20 +562,26 @@ export function useInputState() {
 		};
 	}, []);
 
-	// Set full InputState (for history navigation)
-	const setInputState = useCallback((newState: InputState) => {
-		setCurrentState(newState);
-		pasteDetectorRef.current.updateState(newState.displayValue);
-	}, []);
+	// Replace the input without recording an undo step (history navigation,
+	// completions, restored drafts). Through the store like every other
+	// writer, so Enter or a key in the same stdin batch sees the new input.
+	const setInputState = useCallback(
+		(newState: InputState) => {
+			commit({...storeRef.current, current: newState});
+			pasteDetectorRef.current.updateState(newState.displayValue);
+		},
+		[commit],
+	);
 
 	// Legacy setters for compatibility
-	const setInput = useCallback((newInput: string) => {
-		setCurrentState(prev => ({
-			...prev,
-			displayValue: newInput,
-		}));
-		pasteDetectorRef.current.updateState(newInput);
-	}, []);
+	const setInput = useCallback(
+		(newInput: string) => {
+			const store = storeRef.current;
+			commit({...store, current: {...store.current, displayValue: newInput}});
+			pasteDetectorRef.current.updateState(newInput);
+		},
+		[commit],
+	);
 
 	// Compute legacy pastedContent for backward compatibility
 	const legacyPastedContent = useMemo(() => {
@@ -374,12 +598,16 @@ export function useInputState() {
 		() => ({
 			// New spec-compliant interface
 			currentState,
-			undoStack,
-			redoStack,
+			// Latest state, ahead of a re-render - for reads that can run in the
+			// same stdin batch as the edit that changed it (Enter after a paste).
+			currentStateRef,
+			undoStack: snapshot.undo,
+			redoStack: snapshot.redo,
 			undo,
 			redo,
 			deletePlaceholder,
 			setInputState,
+			insertPaste,
 
 			// Legacy interface for compatibility
 			input: currentState.displayValue,
@@ -396,12 +624,14 @@ export function useInputState() {
 		}),
 		[
 			currentState,
-			undoStack,
-			redoStack,
+			currentStateRef,
+			snapshot.undo,
+			snapshot.redo,
 			undo,
 			redo,
 			deletePlaceholder,
 			setInputState,
+			insertPaste,
 			originalInput,
 			historyIndex,
 			setInput,

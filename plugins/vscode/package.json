@@ -2,7 +2,7 @@
 	"name": "nanocoder-vscode",
 	"displayName": "Nanocoder",
 	"description": "VS Code integration for Nanocoder - local-first AI coding assistant",
-	"version": "0.3.0",
+	"version": "0.4.0",
 	"publisher": "nanocollective",
 	"repository": {
 		"type": "git",
@@ -30,6 +30,25 @@
 	"main": "./dist/extension.js",
 	"icon": "media/icon.png",
 	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "nanocoder-sidebar",
+					"title": "Nanocoder",
+					"icon": "media/icon.svg"
+				}
+			]
+		},
+		"views": {
+			"nanocoder-sidebar": [
+				{
+					"type": "webview",
+					"id": "nanocoder.chatView",
+					"name": "Chat",
+					"icon": "media/icon.svg"
+				}
+			]
+		},
 		"commands": [
 			{
 				"command": "nanocoder.connect",
@@ -45,50 +64,191 @@
 				"command": "nanocoder.startCli",
 				"title": "Start Nanocoder CLI",
 				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.restartAcp",
+				"title": "Restart Nanocoder Agent Process",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.showOutput",
+				"title": "Show Output Logs",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.toggleHistory",
+				"title": "View Session History",
+				"category": "Nanocoder",
+				"icon": "$(history)"
+			},
+			{
+				"command": "nanocoder.openConfig",
+				"title": "Open Configuration",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.newChat",
+				"title": "New Chat",
+				"category": "Nanocoder",
+				"icon": "$(add)"
+			},
+			{
+				"command": "nanocoder.toggleSettings",
+				"title": "Settings",
+				"category": "Nanocoder",
+				"icon": "$(gear)"
+			},
+			{
+				"command": "nanocoder.cancel",
+				"title": "Cancel Current Response",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.copyLastCodeBlock",
+				"title": "Copy Last Code Block",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.explainCode",
+				"title": "Explain Code",
+				"category": "Nanocoder"
+			},
+			{
+				"command": "nanocoder.generateTests",
+				"title": "Generate Tests",
+				"category": "Nanocoder"
 			}
 		],
+		"keybindings": [
+			{
+				"command": "nanocoder.copyLastCodeBlock",
+				"key": "ctrl+alt+shift+c",
+				"mac": "cmd+alt+shift+c",
+				"when": "focusedView == nanocoder.chatView"
+			}
+		],
+		"menus": {
+			"view/title": [
+				{
+					"command": "nanocoder.newChat",
+					"when": "view == nanocoder.chatView",
+					"group": "navigation@1"
+				},
+				{
+					"command": "nanocoder.toggleHistory",
+					"when": "view == nanocoder.chatView",
+					"group": "navigation@2"
+				},
+				{
+					"command": "nanocoder.toggleSettings",
+					"when": "view == nanocoder.chatView",
+					"group": "navigation@3"
+				}
+			],
+			"commandPalette": [
+				{
+					"command": "nanocoder.showOutput",
+					"when": "false"
+				},
+				{
+					"command": "nanocoder.explainCode",
+					"when": "false"
+				},
+				{
+					"command": "nanocoder.generateTests",
+					"when": "false"
+				}
+			]
+		},
 		"configuration": {
 			"title": "Nanocoder",
 			"properties": {
 				"nanocoder.serverPort": {
 					"type": "number",
 					"default": 51820,
-					"description": "WebSocket server port for communication with Nanocoder CLI"
+					"description": "WebSocket server port for communication with Nanocoder CLI. Used as a fallback when the discovery file is missing or stale (e.g. when the CLI is running on a remote host over SSH)."
+				},
+				"nanocoder.serverToken": {
+					"type": "string",
+					"default": "",
+					"description": "Per-session bearer token for the Nanocoder CLI companion server. The CLI normally publishes this to its discovery file and the extension reads it from there. Set this manually only when the discovery file is unreachable (e.g. SSH forwarding), copying the token from vscode-server.json in the nanocoder config directory on the CLI's host."
 				},
 				"nanocoder.autoConnect": {
 					"type": "boolean",
-					"default": true,
-					"description": "Automatically connect to Nanocoder CLI on startup"
-				},
-				"nanocoder.autoStartCli": {
-					"type": "boolean",
 					"default": false,
-					"description": "Automatically start Nanocoder CLI if not running"
+					"description": "Automatically connect to Nanocoder CLI on startup (legacy WebSocket companion)"
 				},
 				"nanocoder.showDiffPreview": {
 					"type": "boolean",
 					"default": true,
 					"description": "Show diff preview before applying file changes"
+				},
+				"nanocoder.mode": {
+					"type": "string",
+					"default": "auto-accept",
+					"scope": "resource",
+					"description": "The current operating mode for the Nanocoder assistant: normal, auto-accept, yolo, plan or architect"
+				},
+				"nanocoder.model": {
+					"type": "string",
+					"scope": "machine",
+					"description": "The AI model to use for Nanocoder sessions"
+				},
+				"nanocoder.cliPath": {
+					"type": "string",
+					"scope": "machine",
+					"description": "Absolute path to the nanocoder CLI executable. If empty, uses the globally installed nanocoder."
+				},
+				"nanocoder.cwd": {
+					"type": "string",
+					"scope": "resource",
+					"description": "Working directory for the Nanocoder CLI, new sessions, settings and @ mention search. Defaults to the current VS Code workspace root, and takes priority over it when set. With no folder open, sessions use your home directory and @ mention search finds no files."
+				},
+				"nanocoder.codeLens": {
+					"type": "boolean",
+					"default": true,
+					"scope": "resource",
+					"description": "Show Explain Code / Generate Tests actions above functions and classes in the editor."
+				},
+				"nanocoder.terminalErrors": {
+					"type": "boolean",
+					"default": true,
+					"description": "Offer a Fix with Nanocoder action when a command fails in an integrated terminal. Needs the terminal's shell integration (terminal.integrated.shellIntegration.enabled) to report exit codes; without it nothing is offered. Nothing is sent to the agent until you take the action."
+				},
+				"nanocoder.showTokenUsage": {
+					"type": "boolean",
+					"default": false,
+					"scope": "resource",
+					"description": "Show token usage and estimated cost below chat responses."
 				}
 			}
 		}
 	},
 	"scripts": {
 		"vscode:prepublish": "pnpm run build",
-		"build": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
-		"watch": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
+		"build": "concurrently \"pnpm run build:ext\" \"pnpm run build:css\"",
+		"watch": "concurrently \"pnpm run watch:ext\" \"pnpm run watch:css\"",
+		"build:ext": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+		"watch:ext": "esbuild ./src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
+		"build:css": "tailwindcss -i ./src/styles.css -o ./media/chat-panel.css --minify",
+		"watch:css": "tailwindcss -i ./src/styles.css -o ./media/chat-panel.css --watch",
 		"lint": "eslint src --ext ts"
 	},
 	"devDependencies": {
-		"@types/node": "^25.9.3",
+		"@tailwindcss/cli": "^4.3.3",
+		"@types/node": "^26.1.2",
 		"@types/vscode": "^1.125.0",
 		"@types/ws": "^8.5.10",
 		"@vscode/vsce": "^3.9.1",
+		"concurrently": "^10.0.5",
 		"esbuild": "^0.28.1",
 		"eslint": "^10.1.0",
-		"typescript": "^5.3.0"
+		"tailwindcss": "^4.3.3",
+		"typescript": "^7.0.2"
 	},
 	"dependencies": {
+		"@agentclientprotocol/sdk": "^1.3.0",
+		"diff": "^9.0.0",
 		"ws": "^8.16.0"
 	}
 }

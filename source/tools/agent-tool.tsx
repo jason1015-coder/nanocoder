@@ -7,8 +7,10 @@
  */
 
 import {randomUUID} from 'node:crypto';
+import {buildSubagentFailureMessage} from '@/subagents/failure-message.js';
 import type {SubagentExecutor} from '@/subagents/subagent-executor.js';
 import {getSubagentLoader} from '@/subagents/subagent-loader.js';
+import type {ToolExecutionContext} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import type {NanocoderToolExport} from '@/types/index';
 
@@ -49,6 +51,23 @@ export function setAvailableAgentNames(
 }
 
 /**
+ * What the subagent inherits from the call that started it. The call and run
+ * IDs are only present when there are some, so callers that never set them see
+ * the same context as before they existed.
+ */
+function delegationContext(options?: ToolExecutionContext) {
+	return {
+		sessionId: options?.sessionId,
+		workingDirectory: options?.workingDirectory,
+		...(options?.toolManager && {toolManager: options.toolManager}),
+		...(options?.toolCallId !== undefined && {toolCallId: options.toolCallId}),
+		...(options?.subagentRunId !== undefined && {
+			subagentRunId: options.subagentRunId,
+		}),
+	};
+}
+
+/**
  * Start agent execution and return a promise with a unique agent ID.
  * Like executeBashCommand — starts immediately, doesn't block the caller.
  *
@@ -58,7 +77,7 @@ export function setAvailableAgentNames(
  */
 export function startAgentExecution(
 	args: AgentToolArgs,
-	signal?: AbortSignal,
+	options?: ToolExecutionContext,
 ): {
 	agentId: string;
 	promise: Promise<{content: string; success: boolean; error?: string}>;
@@ -74,6 +93,7 @@ export function startAgentExecution(
 
 	const {subagent_type, description, prompt, context} = args;
 	const executor = executorInstance;
+	const executionContext = delegationContext(options);
 
 	// Wrap in setTimeout(0) to fully detach from the current call stack.
 	// This ensures the caller can set up the live component and Ink can
@@ -91,9 +111,10 @@ export function startAgentExecution(
 					prompt,
 					context,
 				},
-				signal,
+				options?.abortSignal,
 				0,
 				agentId,
+				executionContext,
 			);
 			resolve({
 				content: result.output,
@@ -106,7 +127,10 @@ export function startAgentExecution(
 	return {agentId, promise};
 }
 
-async function executeAgent(args: AgentToolArgs): Promise<string> {
+async function executeAgent(
+	args: AgentToolArgs,
+	options?: ToolExecutionContext,
+): Promise<string> {
 	if (!executorInstance) {
 		throw new Error('Subagent executor not initialized');
 	}
@@ -125,15 +149,22 @@ async function executeAgent(args: AgentToolArgs): Promise<string> {
 		);
 	}
 
-	const result = await executorInstance.execute({
-		subagent_type,
-		description,
-		prompt,
-		context,
-	});
+	const agentId = randomUUID();
+	const result = await executorInstance.execute(
+		{
+			subagent_type,
+			description,
+			prompt,
+			context,
+		},
+		options?.abortSignal,
+		0,
+		agentId,
+		delegationContext(options),
+	);
 
 	if (!result.success) {
-		throw new Error(result.error || 'Subagent execution failed');
+		throw new Error(buildSubagentFailureMessage(result.error, result.output));
 	}
 
 	return result.output;
@@ -168,8 +199,8 @@ const agentCoreTool = tool({
 		},
 		required: ['subagent_type', 'description'],
 	}),
-	execute: async args => {
-		return await executeAgent(args);
+	execute: async (args, options) => {
+		return await executeAgent(args, options as ToolExecutionContext);
 	},
 });
 

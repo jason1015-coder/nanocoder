@@ -3,6 +3,11 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import test from 'ava';
 import {
+	resetPreferencesCache,
+	savePreferences,
+} from '@/config/preferences';
+import {describeProjectTrust} from '@/config/trust/project-trust';
+import {
 	buildLaunchAgentPlist,
 	buildScheduledTaskXml,
 	buildSystemdUnit,
@@ -32,6 +37,27 @@ async function withTempHome(
 	}
 }
 
+/**
+ * installAutoStart's trust check reads/writes preferences through the real
+ * `@/config/preferences` module, so point NANOCODER_CONFIG_DIR at a scratch
+ * directory rather than touching whatever preferences file the machine
+ * running the suite already has (mirrors cli.spec.ts's own helper).
+ */
+async function withIsolatedPreferences<T>(fn: () => Promise<T>): Promise<T> {
+	const configDir = await mkdtemp(join(tmpdir(), 'nanocoder-install-prefs-'));
+	const previous = process.env.NANOCODER_CONFIG_DIR;
+	process.env.NANOCODER_CONFIG_DIR = configDir;
+	resetPreferencesCache();
+	try {
+		return await fn();
+	} finally {
+		if (previous === undefined) delete process.env.NANOCODER_CONFIG_DIR;
+		else process.env.NANOCODER_CONFIG_DIR = previous;
+		resetPreferencesCache();
+		await rm(configDir, {recursive: true, force: true});
+	}
+}
+
 test('projectHash is stable and short', t => {
 	const h = projectHash('/path/to/project');
 	t.is(h, projectHash('/path/to/project'));
@@ -45,6 +71,25 @@ test('buildLaunchAgentPlist contains required keys', t => {
 	t.regex(plist, /<key>WorkingDirectory<\/key>\s*<string>\/some\/project<\/string>/);
 	t.regex(plist, /<key>RunAtLoad<\/key>\s*<true\/>/);
 	t.regex(plist, /<key>KeepAlive<\/key>\s*<true\/>/);
+});
+
+test('buildLaunchAgentPlist escapes ampersands and angle brackets', t => {
+	const plist = buildLaunchAgentPlist('/Users/me/R&D <x>', 'abcd1234ef', 'a&b');
+	t.regex(plist, /<string>\/Users\/me\/R&amp;D &lt;x&gt;<\/string>/);
+	t.regex(plist, /<string>a&amp;b<\/string>/);
+	t.notRegex(plist, /R&D|<x>|a&b/);
+});
+
+test('buildSystemdUnit escapes % and quotes the Environment= value', t => {
+	const unit = buildSystemdUnit('/home/me/my proj/100%', 'abcd1234ef', 'nanocoder');
+	t.regex(unit, /Description=nanocoder daemon for \/home\/me\/my proj\/100%%\n/);
+	t.regex(unit, /WorkingDirectory=\/home\/me\/my proj\/100%%\n/);
+	t.regex(unit, /Environment="NANOCODER_PROJECT_ROOT=\/home\/me\/my proj\/100%%"\n/);
+});
+
+test('buildSystemdUnit escapes quotes and backslashes inside the Environment= value', t => {
+	const unit = buildSystemdUnit('/home/me/a"b\\c', 'abcd1234ef', 'nanocoder');
+	t.true(unit.includes('Environment="NANOCODER_PROJECT_ROOT=/home/me/a\\"b\\\\c"\n'));
 });
 
 test('buildSystemdUnit contains required keys', t => {
@@ -86,6 +131,60 @@ test.serial('installAutoStart on linux writes service at expected path', async t
 		t.regex(contents, /\[Service\]/);
 	});
 });
+
+test.serial(
+	'installAutoStart warns when the project is not trusted',
+	async t => {
+		await withIsolatedPreferences(async () => {
+			await withTempHome(async (home, project) => {
+				const result = await installAutoStart({
+					projectRoot: project,
+					platform: 'linux',
+					home,
+					loadService: false,
+				});
+				// Install still succeeds - the file is written either way - but
+				// names both remedies so the service doesn't just fail forever
+				// with no explanation.
+				t.regex(result.message, /not trusted/);
+				t.regex(result.message, /Run `nanocoder` here once/);
+				t.regex(
+					result.message,
+					/`NANOCODER_TRUST_DIRECTORY=1 nanocoder daemon start`/,
+				);
+				// A per-run flag never persists, so it can't fix the service.
+				t.notRegex(result.message, /--trust-directory/);
+				t.true(await isAutoStartInstalled({projectRoot: project, platform: 'linux', home}));
+			});
+		});
+	},
+);
+
+test.serial(
+	'installAutoStart carries no trust warning once the project is trusted',
+	async t => {
+		await withIsolatedPreferences(async () => {
+			await withTempHome(async (home, project) => {
+				savePreferences({
+					trustedDirectories: [
+						{
+							path: project,
+							fingerprint: describeProjectTrust(project).fingerprint,
+						},
+					],
+				});
+				const result = await installAutoStart({
+					projectRoot: project,
+					platform: 'linux',
+					home,
+					loadService: false,
+				});
+				t.notRegex(result.message, /not trusted/);
+				t.notRegex(result.message, /NANOCODER_TRUST_DIRECTORY/);
+			});
+		});
+	},
+);
 
 test.serial('install is idempotent: running twice keeps a single file', async t => {
 	await withTempHome(async (home, project) => {

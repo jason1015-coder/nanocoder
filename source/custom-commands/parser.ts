@@ -1,12 +1,9 @@
 import {readFileSync} from 'fs';
-import {
-	parseSubscribeBlock,
-	SubscribeParseError,
-} from '@/skills/parse-subscribe';
+import {parseSubscribeBlockOrWarn} from '@/skills/parse-subscribe';
 import type {CustomCommandMetadata, ParsedCustomCommand} from '@/types/index';
 import type {SkillTrigger} from '@/types/skills';
 import {parseYamlObject, splitFrontmatter} from '@/utils/frontmatter';
-import {logError} from '@/utils/message-queue';
+import {notifyError} from '@/utils/message-queue-core';
 
 /**
  * Set of frontmatter keys that are always parsed as arrays
@@ -96,15 +93,17 @@ function parseEnhancedFrontmatter(frontmatter: string): CustomCommandMetadata {
 			continue;
 		}
 
-		// Check for multi-line string indicators
-		if (trimmedLine.endsWith('|') || trimmedLine.endsWith('>')) {
-			const colonIndex = line.indexOf(':');
+		{
+			const colonIndex = findColonOutsideQuotes(line);
 			if (colonIndex !== -1) {
-				currentKey = line.slice(0, colonIndex).trim();
-				isMultiline = true;
-				currentValue = [];
-				indentLevel = 0;
-				continue;
+				const value = line.slice(colonIndex + 1).trim();
+				if (isBlockScalarIndicator(value)) {
+					currentKey = line.slice(0, colonIndex).trim();
+					isMultiline = true;
+					currentValue = [];
+					indentLevel = 0;
+					continue;
+				}
 			}
 		}
 
@@ -158,6 +157,10 @@ function parseEnhancedFrontmatter(frontmatter: string): CustomCommandMetadata {
 	}
 
 	return mapRawToMetadata(raw);
+}
+
+function isBlockScalarIndicator(value: string): boolean {
+	return /^[|>](?:[+-]?\d*|\d+[+-]?)$/.test(value);
 }
 
 /**
@@ -222,7 +225,9 @@ export function parseCommandFile(filePath: string): ParsedCustomCommand {
 			metadata = parseEnhancedFrontmatter(split.frontmatter);
 		} catch (error) {
 			// If parsing fails, treat entire file as content
-			logError(`Failed to parse frontmatter in ${filePath}: ${String(error)}`);
+			notifyError(
+				`Failed to parse frontmatter in ${filePath}: ${String(error)}`,
+			);
 			return {
 				metadata: {},
 				content: fileContent,
@@ -258,15 +263,7 @@ function extractSubscribe(
 ): SkillTrigger[] | undefined {
 	const raw = parseYamlObject(frontmatter);
 	if (!raw || raw.subscribe === undefined) return undefined;
-	try {
-		return parseSubscribeBlock(raw.subscribe);
-	} catch (err) {
-		if (err instanceof SubscribeParseError) {
-			logError(`Invalid subscribe block in ${filePath}: ${err.message}`);
-			return undefined;
-		}
-		throw err;
-	}
+	return parseSubscribeBlockOrWarn(raw.subscribe, filePath);
 }
 
 /**
@@ -289,8 +286,29 @@ export function parseCommandParameterSpec(spec: string): {
 	return {name: spec.slice(0, eq).trim(), defaultValue: spec.slice(eq + 1)};
 }
 
+/** Escape a string so it matches literally inside a RegExp. */
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
- * Replace template variables in command content
+ * Replace template variables in command content.
+ *
+ * Two things here are deliberate and easy to undo by accident.
+ *
+ * The replacement is passed as a FUNCTION, not a string. `String.prototype
+ * .replace` treats a string replacement as a substitution template, so `$&`
+ * would expand to the matched `{{arg}}`, `` $` `` and `$'` would splice a
+ * whole half of the template into the middle of the prompt, and `$$` would
+ * collapse to one `$`. Those are ordinary characters in a shell snippet, a
+ * regex, or a price, and the user never sees what was actually sent. Same
+ * class of bug as #1057 in `string_replace`; `custom-tools/template.ts`
+ * already uses a replacer function for the identical reason.
+ *
+ * The key is escaped before it goes into the pattern. A parameter name is
+ * author-supplied frontmatter, so it can contain a regex metacharacter -
+ * `a(b` used to throw `Invalid regular expression` and take the command
+ * down with it.
  */
 export function substituteTemplateVariables(
 	content: string,
@@ -300,8 +318,8 @@ export function substituteTemplateVariables(
 
 	// Replace {{variable}} patterns
 	for (const [key, value] of Object.entries(variables)) {
-		const pattern = new RegExp(`\\{\\{\\s*${key}\\s*\\}\\}`, 'g');
-		result = result.replace(pattern, value);
+		const pattern = new RegExp(`\\{\\{\\s*${escapeRegExp(key)}\\s*\\}\\}`, 'g');
+		result = result.replace(pattern, () => value);
 	}
 
 	return result;

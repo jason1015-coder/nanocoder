@@ -1,4 +1,5 @@
 import React from 'react';
+import type {SettingsTabId} from '@/app/components/settings-constants';
 import {createLLMClient} from '@/client-factory';
 import {
 	ErrorMessage,
@@ -9,16 +10,14 @@ import {reloadAppConfig} from '@/config/index';
 import {formatConfigLintIssue, lintProviderConfig} from '@/config/lint';
 import {loadAllProviderConfigs} from '@/config/mcp-config-loader';
 import {saveTune, updateLastUsed} from '@/config/preferences';
+import {applyTuneCompaction} from '@/conversation/compaction/auto-compact';
 import type {ActiveMode} from '@/hooks/useAppState';
 import {getToolManager} from '@/message-handler';
 import {getModelContextLimit, getSessionContextLimit} from '@/models/index';
-import {generateKey} from '@/session/key-generator';
+import {bumpReadContentGeneration} from '@/tools/runtime/read-tracker';
 import type {AIProviderConfig, TuneConfig} from '@/types/config';
 import {LLMClient, Message} from '@/types/core';
-import {
-	setAutoCompactMode,
-	setAutoCompactThreshold,
-} from '@/utils/auto-compact';
+import {generateKey} from '@/utils/key-generator';
 
 interface UseModeHandlersProps {
 	client: LLMClient | null;
@@ -33,6 +32,7 @@ interface UseModeHandlersProps {
 	getMessageTokens: (message: Message) => number;
 	setActiveMode: (mode: ActiveMode) => void;
 	setIsSettingsMode: (mode: boolean) => void;
+	setSettingsActiveTab: (tab: SettingsTabId | undefined) => void;
 	addToChatQueue: (component: React.ReactNode) => void;
 	reinitializeMCPServers: (
 		toolManager: import('@/tools/tool-manager').ToolManager,
@@ -53,6 +53,7 @@ export function useModeHandlers({
 	getMessageTokens,
 	setActiveMode,
 	setIsSettingsMode,
+	setSettingsActiveTab,
 	addToChatQueue,
 	reinitializeMCPServers,
 	setTune,
@@ -68,10 +69,11 @@ export function useModeHandlers({
 	const warnIfHistoryWontFit = async (
 		model: string,
 		providerConfig: AIProviderConfig | null,
+		history: Message[],
 	): Promise<void> => {
-		if (messages.length === 0) return;
+		if (history.length === 0) return;
 		try {
-			const used = messages.reduce((sum, m) => sum + getMessageTokens(m), 0);
+			const used = history.reduce((sum, m) => sum + getMessageTokens(m), 0);
 			const limit =
 				getSessionContextLimit() ??
 				(await getModelContextLimit(model, {
@@ -95,10 +97,13 @@ export function useModeHandlers({
 	// provider, so a selection may also switch the active provider. Staying on
 	// the same provider just swaps the model on the live client; crossing to a
 	// different provider spins up a fresh client (and re-runs config lint).
+	// `history` is the conversation the new model will continue: /resume passes
+	// the resumed session's messages, which `messages` here doesn't hold yet.
 	const handleModelSelect = async (
 		selectedProvider: string,
 		selectedModel: string,
 		isProgrammatic: boolean = false,
+		history: Message[] = messages,
 	) => {
 		const sameProvider = selectedProvider === currentProvider;
 
@@ -128,7 +133,11 @@ export function useModeHandlers({
 					);
 				}
 
-				await warnIfHistoryWontFit(selectedModel, client.getProviderConfig());
+				await warnIfHistoryWontFit(
+					selectedModel,
+					client.getProviderConfig(),
+					history,
+				);
 				exitMode();
 				return true;
 			}
@@ -176,7 +185,11 @@ export function useModeHandlers({
 				);
 			}
 
-			await warnIfHistoryWontFit(newModel, newClient.getProviderConfig());
+			await warnIfHistoryWontFit(
+				newModel,
+				newClient.getProviderConfig(),
+				history,
+			);
 
 			// Re-run lint scoped to the newly active provider so any
 			// misconfiguration becomes visible right when it would start
@@ -234,6 +247,7 @@ export function useModeHandlers({
 				setCurrentModel(newModel);
 
 				setMessages([]);
+				bumpReadContentGeneration();
 				await newClient.clearContext();
 
 				const toolManager = getToolManager();
@@ -277,41 +291,73 @@ export function useModeHandlers({
 		}
 	};
 
-	// Handle MCP wizard complete - reinitializes MCP servers
-	const handleMcpWizardComplete = async (configPath?: string) => {
-		exitMode();
-		if (configPath) {
+	/**
+	 * Pick up MCP config written to disk: drop the module-level config cache and
+	 * rebuild the live server connections. Split out of the wizard handler so the
+	 * settings panel can reuse it without also exiting the current mode.
+	 */
+	const reloadMcpServers = async () => {
+		reloadAppConfig();
+
+		const toolManager = getToolManager();
+		if (!toolManager) return;
+		try {
+			await reinitializeMCPServers(toolManager);
 			addToChatQueue(
 				<SuccessMessage
-					key={generateKey('mcp-wizard-complete')}
-					message={`MCP configuration saved to: ${configPath}.`}
+					key={generateKey('mcp-reinit')}
+					message="MCP servers reinitialized with new configuration."
 					hideBox={true}
 				/>,
 			);
+		} catch (mcpError) {
+			addToChatQueue(
+				<ErrorMessage
+					key={generateKey('mcp-reinit-error')}
+					message={`Failed to reinitialize MCP servers: ${String(mcpError)}`}
+					hideBox={true}
+				/>,
+			);
+		}
+	};
 
-			reloadAppConfig();
+	/**
+	 * Pick up provider config written to disk and rebuild the client for the
+	 * current provider/model, leaving messages alone. Split out of the wizard
+	 * handler so the settings panel can reuse it without the mode-exit side
+	 * effects (clearing conversation, resetting to default provider/model).
+	 */
+	const reloadProviders = async () => {
+		reloadAppConfig();
 
-			const toolManager = getToolManager();
-			if (toolManager) {
-				try {
-					await reinitializeMCPServers(toolManager);
-					addToChatQueue(
-						<SuccessMessage
-							key={generateKey('mcp-reinit')}
-							message="MCP servers reinitialized with new configuration."
-							hideBox={true}
-						/>,
-					);
-				} catch (mcpError) {
-					addToChatQueue(
-						<ErrorMessage
-							key={generateKey('mcp-reinit-error')}
-							message={`Failed to reinitialize MCP servers: ${String(mcpError)}`}
-							hideBox={true}
-						/>,
-					);
-				}
-			}
+		try {
+			const {client: newClient, actualProvider} = await createLLMClient(
+				currentProvider,
+				currentModel,
+			);
+
+			setClient(newClient);
+			setCurrentProvider(actualProvider);
+			setCurrentProviderConfig(newClient.getProviderConfig());
+
+			const newModel = newClient.getCurrentModel();
+			setCurrentModel(newModel);
+
+			addToChatQueue(
+				<SuccessMessage
+					key={generateKey('providers-reloaded')}
+					message="Provider configuration reloaded."
+					hideBox={true}
+				/>,
+			);
+		} catch (error) {
+			addToChatQueue(
+				<ErrorMessage
+					key={generateKey('providers-reload-error')}
+					message={`Failed to reload provider configuration: ${String(error)}`}
+					hideBox={true}
+				/>,
+			);
 		}
 	};
 
@@ -320,17 +366,13 @@ export function useModeHandlers({
 		setTune(config);
 		saveTune(config);
 
-		// Apply/remove auto-compact session overrides
-		if (config.enabled && config.aggressiveCompact) {
-			setAutoCompactThreshold(40);
-			setAutoCompactMode('aggressive');
-		} else {
-			setAutoCompactThreshold(null);
-			setAutoCompactMode(null);
-		}
+		// Tune's aggressive compact is its own layer below the user's explicit
+		// `/compact` overrides, so toggling it never clears those.
+		applyTuneCompaction(config);
 
 		// Clear conversation when toggling — tool profiles change what's available
 		setMessages([]);
+		bumpReadContentGeneration();
 		if (client) {
 			await client.clearContext();
 		}
@@ -365,19 +407,20 @@ export function useModeHandlers({
 		// Convenience enter helpers
 		enterModelSelectionMode: () => enterMode('model'),
 		enterModelDatabaseMode: () => enterMode('modelDatabase'),
-		enterConfigWizardMode: () => enterMode('configWizard'),
-		enterMcpWizardMode: () => enterMode('mcpWizard'),
 		enterExplorerMode: () => enterMode('explorer'),
 		enterIdeSelectionMode: () => enterMode('ideSelection'),
-		enterSettingsMode: () => setIsSettingsMode(true),
+		enterSettingsMode: (tab?: SettingsTabId) => {
+			setSettingsActiveTab(tab);
+			setIsSettingsMode(true);
+		},
 		// Cancel/complete handlers
 		handleModelSelect,
 		handleModelSelectionCancel: exitMode,
 		handleModelDatabaseCancel: exitMode,
 		handleConfigWizardComplete,
 		handleConfigWizardCancel: exitMode,
-		handleMcpWizardComplete,
-		handleMcpWizardCancel: exitMode,
+		reloadMcpServers,
+		reloadProviders,
 		handleSettingsCancel: () => setIsSettingsMode(false),
 		handleExplorerCancel: exitMode,
 		handleIdeSelectionCancel: exitMode,

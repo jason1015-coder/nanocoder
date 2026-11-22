@@ -1,15 +1,26 @@
+import {lstat} from 'node:fs/promises';
 import path from 'node:path';
 import {Box, Text} from 'ink';
 import React from 'react';
 import ToolMessage from '@/components/tool-message';
-import {DEFAULT_SEARCH_RESULTS, MAX_SEARCH_RESULTS} from '@/constants';
+import {
+	DEFAULT_SEARCH_RESULTS,
+	MAX_SEARCH_RESULTS,
+	TOOL_OUTPUT_DISPLAY_LINES,
+} from '@/constants';
 import {ThemeContext} from '@/hooks/useTheme';
+import {
+	getContainedSessionCwd,
+	getProjectRoot,
+	getSessionCwd,
+} from '@/services/session-cwd';
+import {recordVisibilityReceipt} from '@/tools/runtime/read-tracker';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {searchProjectContents} from '@/utils/file-search';
-import {isValidFilePath} from '@/utils/path-validation';
-import {calculateTokens} from '@/utils/token-calculator';
+import {searchProjectContents} from '@/utils/fs/file-search';
+import {isValidFilePath, resolveFilePath} from '@/utils/fs/path-validation';
+import {estimateTokens} from '@/utils/token-calculator';
 
 const MAX_CONTEXT_LINES = 10;
 
@@ -31,48 +42,125 @@ const executeSearchFileContents = async (
 		return 'Error: Search query cannot be empty';
 	}
 
-	const cwd = process.cwd();
+	const cwd = getSessionCwd();
 	const maxResults = Math.min(
 		args.maxResults || DEFAULT_SEARCH_RESULTS,
 		MAX_SEARCH_RESULTS,
 	);
 	const caseSensitive = args.caseSensitive || false;
 
-	// Validate and resolve search path if provided
+	// Validate and resolve search path if provided. Resolve relative to the
+	// session cwd, but bound containment to the project root so an absolute
+	// in-project path (e.g. the workspace root) is not rejected once the shell
+	// has `cd`-ed into a subdir. Containment must be symlink-aware: ripgrep
+	// follows a symlink named on its command line even without --follow, so a
+	// lexically in-project `link -> ~` would grep the home directory.
+	const root = getProjectRoot();
 	let searchPath: string | undefined;
 	if (args.path) {
-		if (!isValidFilePath(args.path)) {
+		if (!isValidFilePath(args.path, root)) {
 			return `Error: Invalid path "${args.path}"`;
 		}
-		searchPath = path.resolve(cwd, args.path);
-		if (!searchPath.startsWith(path.resolve(cwd))) {
+		try {
+			searchPath = resolveFilePath(args.path, cwd, root);
+		} catch {
 			return `Error: Path escapes project directory: ${args.path}`;
 		}
 	}
 
+	// Default search root when no path is given: clamp to the project so a `cd`
+	// outside it (e.g. `cd /etc`) can't grep the whole filesystem.
+	const searchRoot = getContainedSessionCwd();
+
+	const contextLines = Math.min(args.contextLines ?? 0, MAX_CONTEXT_LINES);
+
 	try {
 		const {matches, truncated} = await searchProjectContents(
 			args.query,
-			cwd,
+			searchRoot,
 			maxResults,
 			caseSensitive,
 			args.include,
 			searchPath,
 			args.wholeWord,
-			Math.min(args.contextLines ?? 0, MAX_CONTEXT_LINES),
+			contextLines,
 		);
 
 		if (matches.length === 0) {
 			return `No matches found for "${args.query}"`;
 		}
 
-		// Format results with clear file:line format
+		// Record visibility receipts for lines shown in search results
+		// Group matches by file to batch the receipt recording
+		const matchesByFile = new Map<string, number[]>();
+		for (const match of matches) {
+			// Resolve relative to searchRoot (where the search actually ran),
+			// not project root, so the key matches what edit tools will use
+			const absPath = path.resolve(searchRoot, match.file);
+			if (!matchesByFile.has(absPath)) {
+				matchesByFile.set(absPath, []);
+			}
+			// Record the match line and context lines if present
+			const fileLines = matchesByFile.get(absPath);
+			if (!fileLines) continue;
+			const startLine = Math.max(1, match.line - contextLines);
+			const endLine = match.line + contextLines;
+			for (let i = startLine; i <= endLine; i++) {
+				if (!fileLines.includes(i)) {
+					fileLines.push(i);
+				}
+			}
+		}
+
+		// Record visibility receipts for each file's shown lines
+		for (const [absPath, lines] of matchesByFile) {
+			try {
+				const stats = await lstat(absPath);
+				// Record each range of consecutive lines
+				lines.sort((a, b) => a - b);
+				let rangeStart = lines[0];
+				let rangeEnd = lines[0];
+
+				for (let i = 1; i < lines.length; i++) {
+					if (lines[i] === rangeEnd + 1) {
+						// Consecutive line, extend range
+						rangeEnd = lines[i];
+					} else {
+						// Gap found, record current range and start new one
+						recordVisibilityReceipt(absPath, stats, rangeStart, rangeEnd);
+						rangeStart = lines[i];
+						rangeEnd = lines[i];
+					}
+				}
+				// Record the last range
+				recordVisibilityReceipt(absPath, stats, rangeStart, rangeEnd);
+			} catch {
+				// If we can't stat the file, skip recording (file may have been deleted)
+			}
+		}
+
+		// Format results grep-style. Without context every match is a single
+		// line (`file:line:content`) and matches are newline-separated, with no
+		// blank line between them.
+		//
+		// With context, the search returns a multi-line block already prefixed
+		// per-line with its own line number, so the header uses `-` instead of
+		// `:` (grep's convention for context rather than an exact match) and
+		// blocks are blank-line separated so their boundaries stay legible.
+		//
+		// `contextLines` applies to the whole call, so it decides the layout for
+		// every match. Sniffing each match's content for a newline would get
+		// this wrong whenever a context block collapses to one line, which
+		// happens on single-line files and when truncation drops every newline.
 		let output = `Found ${matches.length} match${matches.length === 1 ? '' : 'es'}${truncated ? ` (showing first ${maxResults})` : ''}:\n\n`;
 
-		for (const match of matches) {
-			output += `${match.file}:${match.line}\n`;
-			output += `  ${match.content}\n\n`;
-		}
+		output += contextLines
+			? matches
+					.map(match => `${match.file}:${match.line}-\n${match.content}`)
+					.join('\n\n')
+			: matches
+					.map(match => `${match.file}:${match.line}:${match.content}`)
+					.join('\n');
 
 		return output.trim();
 	} catch (error: unknown) {
@@ -151,18 +239,27 @@ const SearchFileContentsFormatter = React.memo(
 		}
 		const {colors} = themeContext;
 
-		// Parse result to get match count
+		// Parse result: a "Found N matches" header, then a blank line, then the
+		// grep-style hits the model received.
 		let matchCount = 0;
+		let hitLines: string[] = [];
 		if (result && !result.startsWith('Error:')) {
-			const firstLine = result.split('\n')[0];
-			const matchFound = firstLine.match(/Found (\d+)/);
+			const [header, ...body] = result.split('\n\n');
+			const matchFound = header?.match(/Found (\d+)/);
 			if (matchFound) {
 				matchCount = parseInt(matchFound[1], 10);
 			}
+			if (body.length > 0) {
+				hitLines = body.join('\n\n').split('\n');
+			}
 		}
+		const hiddenHitCount = Math.max(
+			0,
+			hitLines.length - TOOL_OUTPUT_DISPLAY_LINES,
+		);
 
 		// Calculate tokens
-		const tokens = result ? calculateTokens(result) : 0;
+		const tokens = result ? estimateTokens(result) : 0;
 
 		const messageContent = (
 			<Box flexDirection="column">
@@ -218,6 +315,21 @@ const SearchFileContentsFormatter = React.memo(
 					<Text color={colors.secondary}>Matches: </Text>
 					<Text color={colors.text}>{matchCount}</Text>
 				</Box>
+
+				{hitLines.length > 0 && (
+					<Box flexDirection="column">
+						{hitLines.slice(0, TOOL_OUTPUT_DISPLAY_LINES).map((line, index) => (
+							<Text key={index} wrap="truncate-end" color={colors.text}>
+								{line || ' '}
+							</Text>
+						))}
+						{hiddenHitCount > 0 && (
+							<Text color={colors.secondary}>
+								… (+{hiddenHitCount} more lines)
+							</Text>
+						)}
+					</Box>
+				)}
 
 				{tokens > 0 && (
 					<Box>

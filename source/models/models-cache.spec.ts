@@ -1,9 +1,10 @@
 import test from 'ava';
 import { unlink, writeFile, readFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
 import type { CachedModelsData } from './models-types.js';
+import { getCachePath } from '../config/platform-dirs.js';
 import {
 	readCache,
 	writeCache,
@@ -14,17 +15,7 @@ import {
 let actualCachePath: string;
 
 async function getCacheFilePath(): Promise<string> {
-	// Import dynamically to avoid module resolution issues during testing
-	const { xdgCache } = await import('xdg-basedir');
-	const path = await import('node:path');
-
-	const DEFAULT_CACHE_DIR =
-		process.platform === 'darwin'
-			? path.join(process.env.HOME || '~', 'Library', 'Caches')
-			: path.join(process.env.HOME || '~', '.cache');
-
-	const cacheBase = xdgCache || DEFAULT_CACHE_DIR;
-	return path.join(cacheBase, 'nanocoder', 'models.json');
+	return join(getCachePath(), 'models.json');
 }
 
 // ============================================================================
@@ -211,4 +202,50 @@ test('writeCache overwrites existing cache', async t => {
 
 	t.truthy(readResult);
 	t.deepEqual(readResult?.data, secondData);
+});
+
+// ============================================================================
+// Windows regression: cache path must use os.homedir(), not process.env.HOME
+// Regression for https://github.com/Nano-Collective/nanocoder/pull/886
+// When process.env.HOME is undefined (Windows default), the old code produced
+// a literal "~" directory instead of resolving the user's home directory.
+// ============================================================================
+
+test('os.homedir() resolves correctly when HOME env is undefined (unlike process.env.HOME)', t => {
+	const savedHome = process.env.HOME;
+	delete process.env.HOME;
+
+	try {
+		// The old broken pattern: process.env.HOME || '~'
+		const brokenPath = join(process.env.HOME || '~', '.cache');
+		// The fixed pattern: os.homedir()
+		const fixedPath = join(homedir(), '.cache');
+
+		// On Windows, process.env.HOME is undefined, so old code yields literal "~"
+		t.true(
+			brokenPath.startsWith('~'),
+			`Old code produces literal ~ directory: ${brokenPath}`,
+		);
+		// os.homedir() always resolves to the real home directory
+		t.false(
+			fixedPath.startsWith('~'),
+			`Fixed code resolves real home: ${fixedPath}`,
+		);
+		t.not(brokenPath, fixedPath, 'Fix must produce a different path than the old code');
+	} finally {
+		if (savedHome === undefined) {
+			delete process.env.HOME;
+		} else {
+			process.env.HOME = savedHome;
+		}
+	}
+});
+
+test('actual cache path does not contain literal ~', async t => {
+	const cachePath = join(getCachePath(), 'models.json');
+
+	t.false(cachePath.includes('~'), `Cache path must not contain literal ~: ${cachePath}`);
+	// The suite points XDG_CACHE_HOME at a temp dir (test-utils/isolated-models-cache),
+	// so assert the path is fully expanded rather than that it sits under $HOME.
+	t.true(isAbsolute(cachePath), `Cache path must be absolute: ${cachePath}`);
 });

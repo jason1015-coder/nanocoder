@@ -1,33 +1,48 @@
 import {constants} from 'node:fs';
-import {access, lstat, readFile} from 'node:fs/promises';
+import {access, lstat, stat} from 'node:fs/promises';
 import {resolve} from 'node:path';
 import {Box, Text} from 'ink';
 import React from 'react';
 import ToolMessage from '@/components/tool-message';
 import {
 	EMPTY_CONTENT_MARKER,
-	FILE_READ_CHUNK_SIZE_LINES,
-	FILE_READ_CHUNKING_HINT_THRESHOLD_LINES,
-	FILE_READ_METADATA_THRESHOLD_LINES,
+	FILE_READ_PREVIEW_LINES,
+	FILE_READ_PREVIEW_THRESHOLD_LINES,
 	MAX_LINE_LENGTH_CHARS,
 } from '@/constants';
 import {ThemeContext} from '@/hooks/useTheme';
-import type {NanocoderToolExport} from '@/types/core';
+import {
+	MAX_IMAGE_BYTES,
+	mediaTypeForPath,
+	readImageFile,
+} from '@/input/clipboard-image';
+import {getProjectRoot, getSafeSessionCwd} from '@/services/session-cwd';
+import {
+	markFileSeen,
+	matchReadContent,
+	READ_STUB_MARKER,
+	recordVisibilityReceipt,
+	rememberReadContent,
+} from '@/tools/runtime/read-tracker';
+import type {NanocoderToolExport, VisualToolOutput} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {getCachedFileContent} from '@/utils/file-cache';
-import {getFileType} from '@/utils/file-type-detector';
-import {isValidFilePath, resolveFilePath} from '@/utils/path-validation';
-import {markFileSeen} from '@/utils/read-tracker';
-import {calculateTokens} from '@/utils/token-calculator';
+import {getCachedFileContent} from '@/utils/fs/file-cache';
+import {getFileType} from '@/utils/fs/file-type-detector';
+import {isValidFilePath, resolveFilePath} from '@/utils/fs/path-validation';
+import {estimateTokens} from '@/utils/token-calculator';
+
+function formatReadStub(path: string, lineCount: number, size: number): string {
+	return `[file: ${path} — ${READ_STUB_MARKER} (${lineCount} lines, ${size} bytes). pass start_line/end_line to read the body again.]`;
+}
 
 const executeReadFile = async (args: {
 	path: string;
 	start_line?: number;
 	end_line?: number;
 	metadata_only?: boolean;
-}): Promise<string> => {
-	const absPath = resolve(args.path);
+}): Promise<string | VisualToolOutput> => {
+	const absPath = resolve(getSafeSessionCwd(), args.path);
 
 	try {
 		// Handle explicit metadata_only request
@@ -49,7 +64,7 @@ const executeReadFile = async (args: {
 			output += `${'='.repeat(50)}\n\n`;
 
 			output += `Type: ${type}\n`;
-			output += `Size: ${size.toLocaleString()} bytes\n`;
+			output += `Size: ${size} bytes\n`;
 			output += `Last Modified: ${lastModified}\n`;
 
 			// For regular files, try to get additional info
@@ -59,31 +74,24 @@ const executeReadFile = async (args: {
 				// Try to detect encoding and line count
 				try {
 					const cached = await getCachedFileContent(absPath);
-					const lines = cached.lines;
 					const content = cached.content;
 
-					output += `Lines: ${lines.length.toLocaleString()}\n`;
-					output += `Estimated Tokens: ~${calculateTokens(content).toLocaleString()}\n`;
+					output += `Lines: ${cached.totalLines}\n`;
+					output += `Estimated Tokens: ~${estimateTokens(content)}\n`;
 
 					// Detect file type from extension
 					const fileType = getFileType(absPath);
 					output += `File Type: ${fileType}\n`;
 
-					// Detect likely encoding (simple heuristic)
-					let encoding = 'UTF-8';
-					try {
-						if (
-							absPath.toLowerCase().endsWith('.pdf') ||
-							absPath.toLowerCase().endsWith('.docx')
-						) {
-							encoding = 'Binary (Converted to Markdown)';
-						} else {
-							// Try to read as UTF-8
-							await readFile(absPath, 'utf-8');
-						}
-					} catch (_error: unknown) {
-						encoding = 'Binary/Unknown';
-					}
+					// `derived` and `notUtf8` record what the cache actually found for
+					// this path, so the label cannot disagree with the content above.
+					// Reading the file as UTF-8 never fails, since Node replaces bytes
+					// that don't decode with U+FFFD, so only the raw bytes can tell.
+					const encoding = cached.derived
+						? 'Binary (Converted to Markdown)'
+						: cached.notUtf8
+							? 'Not valid UTF-8 (a legacy encoding such as Latin-1, Windows-1252 or Shift-JIS, or binary data)'
+							: 'UTF-8';
 					output += `Encoding: ${encoding}\n`;
 				} catch (error: unknown) {
 					// If we can't read it, mark as not readable
@@ -102,60 +110,77 @@ const executeReadFile = async (args: {
 			return output;
 		}
 
+		// stat, not lstat: a symlink's own mtime/size never change when its
+		// target does, so the stub check must compare the target's.
+		const stats = await stat(absPath);
+
+		// Images are sent as image parts so a vision-capable model can see them.
+		// This runs before the text path below: decoding image bytes as UTF-8
+		// yields garbage, and the read-tracker/stub logic only applies to text.
+		const imageMediaType = mediaTypeForPath(absPath);
+		if (imageMediaType && stats.isFile()) {
+			const image = readImageFile(absPath);
+			if (!image) {
+				throw new Error(`Could not read image "${args.path}"`);
+			}
+			return {
+				llmContent: `[image: ${args.path} — ${imageMediaType}, ${stats.size} bytes]`,
+				images: [image],
+			};
+		}
+
+		if (stats.isFile()) {
+			const stub = matchReadContent(
+				absPath,
+				stats,
+				args.start_line,
+				args.end_line,
+			);
+			if (stub) {
+				return formatReadStub(args.path, stub.lineCount, stub.size);
+			}
+		}
+
 		const cached = await getCachedFileContent(absPath);
 		const content = cached.content;
 
 		if (content.length === 0) {
 			// An empty file has been seen in full; allow edits/overwrites against it.
 			markFileSeen(absPath);
+			rememberReadContent(absPath, stats, 0, args.start_line, args.end_line);
+			recordVisibilityReceipt(absPath, stats, undefined, undefined);
 			return EMPTY_CONTENT_MARKER;
 		}
 
 		const lines = cached.lines;
-		const totalLines = lines.length;
-		const fileSize = content.length;
-		const estimatedTokens = calculateTokens(content);
+		const totalLines = cached.totalLines;
 
-		// Progressive disclosure: metadata first for files >300 lines
-		// Small files can be read directly without ranges
+		// Return a bounded preview only for very large files. Most files can be
+		// understood and edited after a single read; truly large files still have
+		// an explicit, recoverable path to the remaining content.
 		if (
 			args.start_line === undefined &&
 			args.end_line === undefined &&
-			totalLines > FILE_READ_METADATA_THRESHOLD_LINES
+			totalLines > FILE_READ_PREVIEW_THRESHOLD_LINES
 		) {
-			// Return metadata only for medium/large files
-			// Detect file type from extension
-			const fileType = getFileType(absPath);
+			const previewEndLine = Math.min(FILE_READ_PREVIEW_LINES, totalLines);
+			const preview = lines.slice(0, previewEndLine).join('\n');
 
-			let output = `File: ${args.path}\n`;
-			output += `Type: ${fileType}\n`;
-			output += `Total lines: ${totalLines.toLocaleString()}\n`;
-			output += `Size: ${fileSize.toLocaleString()} bytes\n`;
-			output += `Estimated tokens: ~${estimatedTokens.toLocaleString()}\n\n`;
+			// The model has received real content, even though the rest is omitted.
+			// Marking it seen keeps the read-before-edit guard aligned with the
+			// content that was actually returned, just like a ranged read.
+			markFileSeen(absPath);
+			rememberReadContent(
+				absPath,
+				stats,
+				totalLines,
+				args.start_line,
+				args.end_line,
+			);
+			// Record visibility receipt for the preview lines shown
+			recordVisibilityReceipt(absPath, stats, 1, previewEndLine);
 
-			if (totalLines <= FILE_READ_CHUNKING_HINT_THRESHOLD_LINES) {
-				output += `[Medium file - To read specific sections, call read_file with start_line and end_line]\n`;
-				output += `[To read entire file progressively, make multiple calls:]\n`;
-				output += `  - read_file({path: "${args.path}", start_line: 1, end_line: ${FILE_READ_CHUNK_SIZE_LINES}})\n`;
-				output += `  - read_file({path: "${args.path}", start_line: ${FILE_READ_CHUNK_SIZE_LINES + 1}, end_line: ${totalLines}})\n`;
-			} else {
-				output += `[Large file - Choose one approach:]\n`;
-				output += `[1. Targeted read: Use search_files to find code, then read specific ranges]\n`;
-				output += `[2. Progressive read: Read file in chunks (recommended chunk size: 200-300 lines)]\n`;
-				output += `   Example chunks for ${totalLines} lines:\n`;
-				const chunkSize = FILE_READ_CHUNK_SIZE_LINES;
-				const numChunks = Math.ceil(totalLines / chunkSize);
-				for (let i = 0; i < Math.min(numChunks, 3); i++) {
-					const start = i * chunkSize + 1;
-					const end = Math.min((i + 1) * chunkSize, totalLines);
-					output += `   - read_file({path: "${args.path}", start_line: ${start}, end_line: ${end}})\n`;
-				}
-				if (numChunks > 3) {
-					output += `   ... and ${numChunks - 3} more chunks to complete the file\n`;
-				}
-			}
-
-			return output;
+			return `${preview}\n\n[Truncated at line ${previewEndLine} of ${totalLines}. Use read_file with start_line: ${previewEndLine + 1} and end_line to continue.]`;
 		}
 
 		// Line ranges specified - read and return content
@@ -170,6 +195,15 @@ const executeReadFile = async (args: {
 		// Content (full file or an explicit range) has been returned to the model,
 		// so it has now "seen" this file for read-before-edit purposes.
 		markFileSeen(absPath);
+		rememberReadContent(
+			absPath,
+			stats,
+			totalLines,
+			args.start_line,
+			args.end_line,
+		);
+		// Record visibility receipt for the actual lines returned
+		recordVisibilityReceipt(absPath, stats, startLine, endLine);
 
 		// Return content without line numbers for clean content-based editing
 		return linesToReturn.join('\n');
@@ -190,7 +224,7 @@ const executeReadFile = async (args: {
 
 const readFileCoreTool = tool({
 	description:
-		'Read file contents. Use this INSTEAD OF bash cat/head/tail/less commands. PROGRESSIVE DISCLOSURE: Files ≤300 lines return content directly. Files >300 lines return metadata first - then call again with start_line/end_line to read specific sections. Use metadata_only=true for file info (size, lines, type) without reading content.',
+		'Read file contents. Use this INSTEAD OF bash cat/head/tail/less commands. PROGRESSIVE DISCLOSURE: Files ≤1500 lines return content directly. Larger files return a 250-line preview with a continuation hint - use start_line/end_line to read additional sections. Use metadata_only=true for file info (size, lines, type) without reading content. Repeating the same path and line range while the file is unchanged returns a short stub; pass start_line/end_line to read the body again. Image files (png, jpg, jpeg, gif, webp, up to 10 MB) are returned as images that a vision-capable model can see.',
 	inputSchema: jsonSchema<{
 		path: string;
 		start_line?: number;
@@ -206,12 +240,12 @@ const readFileCoreTool = tool({
 			start_line: {
 				type: 'number',
 				description:
-					'Optional: Line number to start reading from (1-indexed). Required for files >300 lines. Use with end_line to read specific range.',
+					'Optional: Line number to start reading from (1-indexed). Use with end_line to read a specific range or continue a large-file preview.',
 			},
 			end_line: {
 				type: 'number',
 				description:
-					'Optional: Line number to stop reading at (inclusive). Required for files >300 lines. Use with start_line to read specific range.',
+					'Optional: Line number to stop reading at (inclusive). Use with start_line to read a specific range or continue a large-file preview.',
 			},
 			metadata_only: {
 				type: 'boolean',
@@ -249,9 +283,12 @@ const ReadFileFormatter = React.memo(
 		fileInfo: {
 			totalLines: number;
 			readLines: number;
+			readEndLine: number;
 			tokens: number;
 			isPartialRead: boolean;
 			isMetadataOnly: boolean;
+			isTruncated: boolean;
+			isImage: boolean;
 		};
 	}) => {
 		const themeContext = React.useContext(ThemeContext);
@@ -280,7 +317,13 @@ const ReadFileFormatter = React.memo(
 					</Box>
 				)}
 
-				{fileInfo.isMetadataOnly ? (
+				{fileInfo.isImage && (
+					<Box>
+						<Text color={colors.info}>(image)</Text>
+					</Box>
+				)}
+
+				{fileInfo.isImage ? null : fileInfo.isMetadataOnly ? (
 					<>
 						<Box>
 							<Text color={colors.secondary}>Total lines: </Text>
@@ -294,13 +337,14 @@ const ReadFileFormatter = React.memo(
 						<Box>
 							<Text color={colors.secondary}>Lines: </Text>
 							<Text color={colors.text}>
-								{args.start_line || 1} - {args.end_line || fileInfo.totalLines}
+								{args.start_line || 1} - {args.end_line || fileInfo.readEndLine}
+								{fileInfo.isTruncated ? ` of ${fileInfo.totalLines}` : ''}
 							</Text>
 						</Box>
 					</>
 				)}
 
-				{!fileInfo.isMetadataOnly && (
+				{!fileInfo.isMetadataOnly && !fileInfo.isImage && (
 					<Box>
 						<Text color={colors.secondary}>Tokens: </Text>
 						<Text color={colors.text}>~{fileInfo.tokens.toLocaleString()}</Text>
@@ -328,53 +372,59 @@ const readFileFormatter = async (
 		return <></>;
 	}
 
-	// Load file info to calculate actual read information
+	// The flag that selects the metadata response shape in executeReadFile.
+	// Boolean() rather than === true so the XML fallback's string 'true'
+	// matches, and set before the read so a directory still renders the
+	// metadata layout.
+	const isMetadataOnly = Boolean(args.metadata_only);
+
+	const requestedPath = args.path || args.file_path;
+	// An image read returns pixels, not lines, so there is no line range or
+	// token count to show (and decoding the bytes as text would be wrong).
+	const isImage =
+		!isMetadataOnly &&
+		typeof requestedPath === 'string' &&
+		mediaTypeForPath(requestedPath) !== undefined;
+
 	let fileInfo = {
 		totalLines: 0,
 		readLines: 0,
+		readEndLine: 0,
 		tokens: 0,
 		isPartialRead: false,
-		isMetadataOnly: false,
+		isMetadataOnly,
+		isTruncated: false,
+		isImage,
 	};
 
 	try {
 		const path = args.path || args.file_path;
-		if (path && typeof path === 'string') {
-			const absPath = resolve(path);
+		if (!isImage && path && typeof path === 'string') {
+			const absPath = resolve(getSafeSessionCwd(), path);
 			const cached = await getCachedFileContent(absPath);
-			const content = cached.content;
-			const lines = cached.lines;
-			const totalLines = lines.length;
+			const totalLines = cached.totalLines;
 
-			// Detect if this was a metadata-only response
-			const isMetadataOnly =
-				(result?.startsWith('File:') ?? false) &&
-				!args.start_line &&
-				!args.end_line &&
-				totalLines > FILE_READ_METADATA_THRESHOLD_LINES;
+			const isTruncated = result?.includes('[Truncated at line ') ?? false;
 
 			// Calculate what was actually read
 			const startLine = args.start_line || 1;
-			const endLine = args.end_line || totalLines;
-			const readLines = endLine - startLine + 1;
-			const isPartialRead = startLine > 1 || endLine < totalLines;
+			const readEndLine = isTruncated
+				? Math.min(FILE_READ_PREVIEW_LINES, totalLines)
+				: args.end_line || totalLines;
+			const readLines = readEndLine - startLine + 1;
+			const isPartialRead = startLine > 1 || readEndLine < totalLines;
 
-			// Calculate tokens
-			let tokens: number;
-			if (isMetadataOnly) {
-				// For metadata, show estimated tokens of the FULL FILE
-				tokens = calculateTokens(content);
-			} else {
-				// For content reads, show tokens of what was actually returned
-				tokens = result ? calculateTokens(result) : 0;
-			}
+			const tokens = isMetadataOnly ? 0 : result ? estimateTokens(result) : 0;
 
 			fileInfo = {
 				totalLines,
 				readLines,
+				readEndLine,
 				tokens,
 				isPartialRead,
 				isMetadataOnly,
+				isTruncated,
+				isImage,
 			};
 		}
 	} catch {
@@ -391,17 +441,18 @@ const readFileValidator = async (args: {
 	metadata_only?: boolean;
 }): Promise<{valid: true} | {valid: false; error: string}> => {
 	// Validate path boundary first to prevent directory traversal
-	if (!isValidFilePath(args.path)) {
+	const cwd = getSafeSessionCwd();
+	const root = getProjectRoot();
+	if (!isValidFilePath(args.path, root)) {
 		return {
 			valid: false,
-			error: `Invalid file path: "${args.path}". Path must be relative and within the project directory.`,
+			error: `Invalid file path: "${args.path}". Path must be within the project directory.`,
 		};
 	}
 
 	// Verify the resolved path stays within project boundaries
 	try {
-		const cwd = process.cwd();
-		resolveFilePath(args.path, cwd);
+		resolveFilePath(args.path, cwd, root);
 	} catch (error) {
 		const errorMessage = formatError(error);
 		return {
@@ -410,10 +461,25 @@ const readFileValidator = async (args: {
 		};
 	}
 
-	const absPath = resolve(args.path);
+	const absPath = resolve(getSafeSessionCwd(), args.path);
 
 	try {
 		await access(absPath, constants.F_OK);
+
+		// Images are read as bytes, not text, so the line and minified-content
+		// checks below do not apply. Only the size cap does.
+		if (mediaTypeForPath(absPath)) {
+			const imageStats = await stat(absPath);
+			if (imageStats.isFile() && imageStats.size > MAX_IMAGE_BYTES) {
+				return {
+					valid: false,
+					error: `Image "${args.path}" is ${imageStats.size} bytes, over the ${MAX_IMAGE_BYTES}-byte limit for images. Resize or compress it and try again.`,
+				};
+			}
+			if (imageStats.isFile()) {
+				return {valid: true};
+			}
+		}
 
 		// Validate line range parameters
 		if (args.start_line !== undefined && args.start_line < 1) {
@@ -437,7 +503,7 @@ const readFileValidator = async (args: {
 		// Auto-clamp end_line to file length instead of erroring
 		if (args.end_line !== undefined) {
 			const cached = await getCachedFileContent(absPath);
-			const totalLines = cached.lines.length;
+			const totalLines = cached.totalLines;
 
 			if (args.end_line > totalLines) {
 				args.end_line = totalLines;
@@ -448,17 +514,19 @@ const readFileValidator = async (args: {
 		// Skip this check for metadata_only requests
 		if (!args.metadata_only) {
 			const cached = await getCachedFileContent(absPath);
+			const allLines = cached.lines;
+			const totalLines = cached.totalLines;
 			const startLine = args.start_line ? Math.max(1, args.start_line) : 1;
 			const endLine = args.end_line
-				? Math.min(cached.lines.length, args.end_line)
-				: cached.lines.length;
+				? Math.min(totalLines, args.end_line)
+				: totalLines;
 
 			for (let i = startLine - 1; i < endLine; i++) {
-				const line = cached.lines[i];
+				const line = allLines[i];
 				if (line && line.length > MAX_LINE_LENGTH_CHARS) {
 					return {
 						valid: false,
-						error: `File "${args.path}" contains minified or binary content (line ${i + 1} has ${line.length.toLocaleString()} characters). This file cannot be read as it would consume excessive tokens without providing useful information.`,
+						error: `File "${args.path}" contains minified or binary content (line ${i + 1} has ${line.length} characters). This file cannot be read as it would consume excessive tokens without providing useful information.`,
 					};
 				}
 			}

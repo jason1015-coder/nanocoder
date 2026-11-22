@@ -7,13 +7,16 @@ import React from 'react';
 import {appendToolDefinitionsToPrompt} from '@/ai-sdk-client/tools/system-prompt-assembler';
 import {UsageDisplay} from '@/components/usage/usage-display';
 import {getAppConfig} from '@/config/index';
+import {
+	buildSystemPrompt,
+	getLastBuiltPrompt,
+} from '@/conversation/prompt-builder';
 import {getToolManager} from '@/message-handler';
 import {
 	getModelContextLimit,
 	getModelPricing,
 	getSessionContextLimit,
 } from '@/models/index';
-import {generateKey} from '@/session/key-generator';
 import {createTokenizer} from '@/tokenization/index';
 import type {Command} from '@/types/commands';
 import type {TuneConfig} from '@/types/config';
@@ -24,7 +27,9 @@ import {
 	calculateTokenBreakdown,
 	calculateToolDefinitionsTokensFromDefs,
 } from '@/usage/calculator';
-import {buildSystemPrompt, getLastBuiltPrompt} from '@/utils/prompt-builder';
+import {calculateUsageCost} from '@/usage/response-usage';
+import {generateKey} from '@/utils/key-generator';
+import {estimateTokens} from '@/utils/token-calculator';
 
 export const usageCommand: Command = {
 	name: 'usage',
@@ -59,11 +64,9 @@ export const usageCommand: Command = {
 		} catch {
 			// Fallback to a simple tokenizer if creation fails
 			tokenizer = {
-				encode: (text: string) => Math.ceil((text || '').length / 4),
+				encode: (text: string) => estimateTokens(text || ''),
 				countTokens: (message: Message) =>
-					Math.ceil(
-						((message.content || '') + (message.role || '')).length / 4,
-					),
+					estimateTokens((message.content || '') + (message.role || '')),
 				getName: () => 'fallback',
 			};
 			tokenizerName = 'fallback (error)';
@@ -100,6 +103,8 @@ export const usageCommand: Command = {
 				nativeToolsDisabled,
 				config.systemPrompt,
 				model,
+				undefined,
+				toolManager,
 			);
 			if (nativeToolsDisabled) {
 				const fallbackToolFormat: 'xml' | 'json' =
@@ -141,9 +146,7 @@ export const usageCommand: Command = {
 						: 0;
 				} catch {
 					// Fallback to simple estimation if tokenization fails
-					return Math.ceil(
-						((message.content || '') + (message.role || '')).length / 4,
-					);
+					return estimateTokens((message.content || '') + (message.role || ''));
 				}
 			},
 		);
@@ -193,19 +196,11 @@ export const usageCommand: Command = {
 				const isSnapshotFresh =
 					snapshot && snapshot.atMessageCount >= messages.length;
 
-				let currentContextCost: number;
-				if (
-					isSnapshotFresh &&
-					snapshot.inputTokens != null &&
-					snapshot.outputTokens != null
-				) {
-					currentContextCost =
-						(pricing.input * snapshot.inputTokens +
-							pricing.output * snapshot.outputTokens) /
-						1_000_000;
-				} else {
-					currentContextCost = (pricing.input * breakdown.total) / 1_000_000;
-				}
+				const reportedContextCost = isSnapshotFresh
+					? calculateUsageCost(snapshot, pricing)
+					: undefined;
+				const currentContextCost =
+					reportedContextCost ?? (pricing.input * breakdown.total) / 1_000_000;
 
 				// ---- Cumulative session + per-provider (from history) ----
 				const history = metadata.apiCallHistory ?? [];
@@ -228,23 +223,7 @@ export const usageCommand: Command = {
 						output: NaN,
 					};
 
-					const knownInputCost =
-						record.inputTokens != null
-							? (recordPricing.input * record.inputTokens) / 1_000_000
-							: 0;
-					const knownOutputCost =
-						record.outputTokens != null
-							? (recordPricing.output * record.outputTokens) / 1_000_000
-							: 0;
-
-					const callCost =
-						record.inputTokens != null && record.outputTokens != null
-							? knownInputCost + knownOutputCost
-							: record.totalTokens != null
-								? (((recordPricing.input + recordPricing.output) / 2) *
-										record.totalTokens) /
-									1_000_000
-								: knownInputCost + knownOutputCost;
+					const callCost = calculateUsageCost(record, recordPricing) ?? 0;
 
 					cumulativeSession += callCost;
 					perProvider[record.provider] =

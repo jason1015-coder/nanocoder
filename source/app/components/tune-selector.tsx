@@ -1,11 +1,11 @@
 import {Box, Text, useInput} from 'ink';
-import SelectInput from 'ink-select-input';
 import {useMemo, useState} from 'react';
 import {StyledSelectInput} from '@/components/ui/styled-select-input';
 import {TitledBoxWithPreferences} from '@/components/ui/titled-box';
 import {useResponsiveTerminal} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
 import {
+	isNanoProfile,
 	TOOL_PROFILE_DESCRIPTIONS,
 	TOOL_PROFILE_TOOLTIPS,
 } from '@/tools/tool-profiles';
@@ -23,6 +23,8 @@ const AVAILABLE_PROFILES: ToolProfile[] = ['auto', 'full', 'minimal', 'nano'];
 
 interface TuneSelectorProps {
 	currentConfig: TuneConfig;
+	/** Active model, used to resolve the 'auto' profile for display. */
+	currentModel?: string;
 	onSelect: (config: TuneConfig) => void;
 	onCancel: () => void;
 }
@@ -91,10 +93,12 @@ const TUNE_PRESETS: TunePreset[] = [
 // Main model mode menu
 function TuneMainMenu({
 	config,
+	model,
 	onAction,
 	onCancel,
 }: {
 	config: TuneConfig;
+	model?: string;
 	onAction: (action: MainAction) => void;
 	onCancel: () => void;
 }) {
@@ -114,9 +118,10 @@ function TuneMainMenu({
 		];
 
 		if (config.enabled) {
-			// includeAgentsMd defaults to false for nano, true otherwise.
+			// includeAgentsMd defaults to false for nano (including 'auto'
+			// resolving to nano for the active model), true otherwise.
 			const agentsMdOn =
-				config.includeAgentsMd ?? config.toolProfile !== 'nano';
+				config.includeAgentsMd ?? !isNanoProfile(config.toolProfile, model);
 			list.push(
 				{
 					label: `Tool Profile - ${config.toolProfile}`,
@@ -144,7 +149,7 @@ function TuneMainMenu({
 		list.push({label: 'Apply & Close', value: 'apply'});
 
 		return list;
-	}, [config]);
+	}, [config, model]);
 
 	useInput((_input, key) => {
 		if (key.escape) {
@@ -173,7 +178,7 @@ function TuneMainMenu({
 					onSelect={item => onAction(item.value)}
 				/>
 				<Box marginBottom={1}></Box>
-				<Text color={colors.secondary}>Enter/Esc</Text>
+				<Text color={colors.secondary}>Enter to apply · Esc back</Text>
 			</Box>
 		);
 	}
@@ -198,7 +203,7 @@ function TuneMainMenu({
 				onSelect={item => onAction(item.value)}
 			/>
 			<Box marginTop={1}>
-				<Text color={colors.secondary}>Enter to select, Esc to cancel</Text>
+				<Text color={colors.secondary}>Enter to select · Esc to cancel</Text>
 			</Box>
 		</TitledBoxWithPreferences>
 	);
@@ -257,7 +262,7 @@ function ToolProfilePanel({
 				flexDirection="column"
 				marginBottom={1}
 			>
-				<SelectInput
+				<StyledSelectInput
 					items={items}
 					initialIndex={initialIndex}
 					onSelect={item => onSelect(item.value as ToolProfile)}
@@ -269,7 +274,9 @@ function ToolProfilePanel({
 					</Text>
 				</Box>
 				<Box marginBottom={1}></Box>
-				<Text color={colors.secondary}>Enter/Shift+Tab/Esc</Text>
+				<Text color={colors.secondary}>
+					Enter to apply · Shift+Tab back · Esc back
+				</Text>
 			</TitledBoxWithPreferences>
 		);
 	}
@@ -286,7 +293,7 @@ function ToolProfilePanel({
 		>
 			<Box marginBottom={1}>
 				<Text color={colors.secondary}>
-					Enter to apply, Shift+Tab to go back, Esc to cancel
+					Enter to apply · Shift+Tab back · Esc back
 				</Text>
 			</Box>
 			<StyledSelectInput
@@ -351,7 +358,7 @@ function PresetPanel({
 				flexDirection="column"
 				marginBottom={1}
 			>
-				<SelectInput
+				<StyledSelectInput
 					items={items}
 					onSelect={item => onSelect(TUNE_PRESETS[Number(item.value)]?.config)}
 					onHighlight={item => setHighlighted(Number(item.value))}
@@ -364,7 +371,9 @@ function PresetPanel({
 					</Box>
 				)}
 				<Box marginBottom={1}></Box>
-				<Text color={colors.secondary}>Enter/Shift+Tab/Esc</Text>
+				<Text color={colors.secondary}>
+					Enter to apply · Shift+Tab back · Esc back
+				</Text>
 			</TitledBoxWithPreferences>
 		);
 	}
@@ -381,7 +390,7 @@ function PresetPanel({
 		>
 			<Box marginBottom={1}>
 				<Text color={colors.secondary}>
-					Enter to load preset, Shift+Tab to go back, Esc to cancel
+					Enter to load preset · Shift+Tab back · Esc back
 				</Text>
 			</Box>
 			<StyledSelectInput
@@ -573,7 +582,7 @@ function ParametersPanel({
 				flexDirection="column"
 				marginBottom={1}
 			>
-				<SelectInput
+				<StyledSelectInput
 					items={items}
 					onSelect={handleSelect}
 					onHighlight={item => setHighlighted(item.value)}
@@ -584,7 +593,9 @@ function ParametersPanel({
 					</Box>
 				)}
 				<Box marginBottom={1}></Box>
-				<Text color={colors.secondary}>Enter to cycle/Shift+Tab/Esc</Text>
+				<Text color={colors.secondary}>
+					Enter to cycle values · Shift+Tab back · Esc back
+				</Text>
 			</TitledBoxWithPreferences>
 		);
 	}
@@ -601,7 +612,7 @@ function ParametersPanel({
 		>
 			<Box marginBottom={1}>
 				<Text color={colors.secondary}>
-					Enter to cycle values, Shift+Tab to go back, Esc to cancel
+					Enter to cycle values · Shift+Tab back · Esc back
 				</Text>
 			</Box>
 			<StyledSelectInput
@@ -621,6 +632,7 @@ function ParametersPanel({
 // Main tune selector with step navigation
 export function TuneSelector({
 	currentConfig,
+	currentModel,
 	onSelect,
 	onCancel,
 }: TuneSelectorProps) {
@@ -677,6 +689,7 @@ export function TuneSelector({
 			return (
 				<TuneMainMenu
 					config={config}
+					model={currentModel}
 					onAction={handleMainAction}
 					onCancel={onCancel}
 				/>

@@ -1,5 +1,6 @@
 import type {LanguageModel} from 'ai';
-import {Agent} from 'undici';
+import type {Dispatcher} from 'undici';
+import {getPrivacyPreference} from '@/config/preferences';
 import {
 	TIMEOUT_SOCKET_DEFAULT_MS,
 	TIMEOUT_SOCKET_LOCAL_DEFAULT_MS,
@@ -15,8 +16,11 @@ import type {
 	StreamCallbacks,
 } from '@/types/index';
 import {getLogger} from '@/utils/logging';
+import {createDispatcher} from '@/utils/proxy-dispatcher';
 import {isLocalURL} from '@/utils/url-utils';
 import {handleChat} from './chat/chat-handler.js';
+import {PrefixTracker} from './chat/prefix-tracker.js';
+import {normalizeModelIdForRequest} from './model-id.js';
 import {
 	createProvider,
 	type TaggedProvider,
@@ -30,9 +34,21 @@ export class AISDKClient implements LLMClient {
 	private currentModel: string;
 	private availableModels: string[];
 	private providerConfig: AIProviderConfig;
-	private undiciAgent: Agent;
+	private undiciAgent: Dispatcher;
 	private cachedContextSize: number;
 	private maxRetries: number;
+	// Placeholder map for callers that do not supply their own. The TUI hands
+	// in its session map; --plain, ACP, subagents and helper calls (titles,
+	// compaction) do not, and used to go out unscrubbed even with scrubbing on.
+	// Kept per client so a placeholder in one reply still rehydrates when the
+	// model echoes it back on a later turn.
+	private readonly privacySessionMapRef: {current: Record<string, string>} = {
+		current: {},
+	};
+
+	// Per client, matching what a single-slot local server caches: see
+	// PrefixTracker for why helper calls on this client are tracked too.
+	private readonly prefixTracker = new PrefixTracker();
 
 	constructor(providerConfig: AIProviderConfig) {
 		const logger = getLogger();
@@ -66,7 +82,7 @@ export class AISDKClient implements LLMClient {
 				? 0
 				: (effectiveSocketTimeout ?? defaultTimeout);
 
-		this.undiciAgent = new Agent({
+		this.undiciAgent = createDispatcher({
 			connect: {
 				timeout: resolvedSocketTimeout,
 				...getTlsConnectOptions(this.providerConfig),
@@ -169,6 +185,12 @@ export class AISDKClient implements LLMClient {
 						? this.provider.provider.responses(this.currentModel)
 						: this.provider.provider.chat(this.currentModel);
 				case 'openai-compatible':
+					return this.provider.provider(
+						normalizeModelIdForRequest(
+							this.providerConfig.config.baseURL,
+							this.currentModel,
+						),
+					) as LanguageModel;
 				case 'anthropic':
 				case 'google':
 					return this.provider.provider(this.currentModel) as LanguageModel;
@@ -186,9 +208,13 @@ export class AISDKClient implements LLMClient {
 			signal,
 			maxRetries: this.maxRetries,
 			modeOverrides,
-			privacySessionMapRef: modeOverrides?.privacySessionMapRef,
-			privacyEnabled: modeOverrides?.privacyEnabled,
+			// Prompt scrubbing is a user preference, so it applies to every
+			// surface, not only the one that remembered to pass it through.
+			privacySessionMapRef:
+				modeOverrides?.privacySessionMapRef ?? this.privacySessionMapRef,
+			privacyEnabled: modeOverrides?.privacyEnabled ?? getPrivacyPreference(),
 			onPrivacyEvent: callbacks.onPrivacyEvent,
+			prefixTracker: this.prefixTracker,
 		});
 	}
 

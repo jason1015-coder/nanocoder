@@ -1,14 +1,18 @@
 import {Box, Text} from 'ink';
 import React, {memo} from 'react';
+import {isInternalWalkthroughMessage} from '@/artifacts/walkthrough-lifecycle';
 import AssistantMessage from '@/components/assistant-message';
 import AssistantReasoning from '@/components/assistant-reasoning';
 import {InfoMessage} from '@/components/message-box';
 import UserMessage from '@/components/user-message';
+import {getShowUsageFooter} from '@/config/preferences';
 import {useTerminalWidth} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
-import {generateKey} from '@/session/key-generator';
+import {parseToolArguments} from '@/tools/runtime/tool-args-parser';
 import type {Message, ToolCall} from '@/types/core';
-import {parseToolArguments} from '@/utils/tool-args-parser';
+import {generateKey} from '@/utils/key-generator';
+import {truncateText} from '@/utils/truncate-text';
+import {stripTurnContext} from '@/utils/turn-context';
 
 /**
  * Cap on how many trailing messages are replayed into scrollback on resume.
@@ -22,8 +26,9 @@ const MAX_REPLAYED_MESSAGES = 60;
 const MAX_DESCRIPTOR_LENGTH = 80;
 
 function truncate(value: string, max = MAX_DESCRIPTOR_LENGTH): string {
-	const single = value.replace(/\s+/g, ' ').trim();
-	return single.length > max ? `${single.slice(0, max - 1)}…` : single;
+	return truncateText(value.replace(/\s+/g, ' ').trim(), max, {
+		unit: 'code-units',
+	});
 }
 
 /**
@@ -129,20 +134,33 @@ export function buildSessionHistoryComponents(
 	model: string,
 ): React.ReactNode[] {
 	const components: React.ReactNode[] = [];
+	// Replayed messages carry no provider usage, so their footer would be the
+	// client-side estimate. Honour the same preference the live footer uses so
+	// a resumed session looks like the session it resumes.
+	const showUsageFooter = getShowUsageFooter();
+	// The walkthrough nudge is an internal protocol message, never something the
+	// user typed, so it must not surface when a session is replayed.
+	const visibleMessages = messages.filter(
+		message => !isInternalWalkthroughMessage(message),
+	);
 
 	// Map every tool result by its tool_call_id across the FULL history, so an
 	// in-window assistant tool call can still find its result even if windowing
 	// trims nearby messages.
 	const resultsById = new Map<string, string>();
-	for (const message of messages) {
+	for (const message of visibleMessages) {
 		if (message.role === 'tool' && message.tool_call_id) {
 			resultsById.set(message.tool_call_id, message.content);
 		}
 	}
 
 	// Replay only the trailing window; note how many earlier messages are hidden.
-	const hiddenCount = Math.max(0, messages.length - MAX_REPLAYED_MESSAGES);
-	const replayed = hiddenCount > 0 ? messages.slice(hiddenCount) : messages;
+	const hiddenCount = Math.max(
+		0,
+		visibleMessages.length - MAX_REPLAYED_MESSAGES,
+	);
+	const replayed =
+		hiddenCount > 0 ? visibleMessages.slice(hiddenCount) : visibleMessages;
 
 	if (hiddenCount > 0) {
 		components.push(
@@ -160,16 +178,22 @@ export function buildSessionHistoryComponents(
 
 	for (const message of replayed) {
 		switch (message.role) {
-			case 'user':
-				if (message.content.trim()) {
+			case 'user': {
+				// Per-turn context is harness-authored, never something the user
+				// typed, so scrollback shows the message without it. The stored
+				// message keeps the block — that is what keeps the replayed
+				// prefix identical to what was originally sent.
+				const userContent = stripTurnContext(message.content);
+				if (userContent.trim()) {
 					components.push(
 						<UserMessage
 							key={generateKey('resume-user')}
-							message={message.content}
+							message={userContent}
 						/>,
 					);
 				}
 				break;
+			}
 
 			case 'assistant': {
 				if (message.reasoning?.trim()) {
@@ -187,6 +211,7 @@ export function buildSessionHistoryComponents(
 							key={generateKey('resume-assistant')}
 							message={message.content}
 							model={model}
+							showUsageFooter={showUsageFooter}
 						/>,
 					);
 				}

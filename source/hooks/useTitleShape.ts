@@ -1,13 +1,25 @@
 import {createContext, useContext} from 'react';
-import type {TitleShape} from '@/components/ui/styled-title';
 import {
 	getTitleShape as getTitleShapeFromPrefs,
 	updateTitleShape as updateTitleShapeInPrefs,
 } from '@/config/preferences';
+import type {TitleShape} from '@/types/ui';
 
 interface TitleShapeContextType {
 	currentTitleShape: TitleShape;
+	/**
+	 * Preview only — updates the in-memory shape (and thus the live app title)
+	 * WITHOUT persisting to preferences. Used to show a live preview while the
+	 * user navigates a shape selector, so an un-committed highlight never
+	 * reaches disk.
+	 */
 	setCurrentTitleShape: (shape: TitleShape) => void;
+	/**
+	 * Commit — persists the shape to preferences and updates the in-memory
+	 * shape. Used when an edit is confirmed (e.g. Enter in the Title Shape
+	 * settings panel).
+	 */
+	commitTitleShape: (shape: TitleShape) => void;
 }
 
 export const TitleShapeContext = createContext<TitleShapeContextType | null>(

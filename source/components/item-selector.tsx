@@ -1,6 +1,6 @@
 import {Box, Text, useInput} from 'ink';
-import SelectInput from 'ink-select-input';
 import {FilterableSelectList} from '@/components/filterable-select-list';
+import {StyledSelectInput} from '@/components/ui/styled-select-input';
 import {TitledBoxWithPreferences} from '@/components/ui/titled-box';
 import {useTerminalWidth} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
@@ -8,6 +8,8 @@ import {useTheme} from '@/hooks/useTheme';
 export interface ItemSelectorOption<TValue extends string = string> {
 	label: string;
 	value: TValue;
+	/** Text the filter matches against, when it should differ from `label`. */
+	searchText?: string;
 }
 
 interface ItemSelectorProps<TValue extends string = string> {
@@ -118,7 +120,7 @@ export function ItemSelector<TValue extends string = string>({
 						onCancel={onCancel}
 					/>
 				) : (
-					<SelectInput
+					<StyledSelectInput
 						items={items}
 						onSelect={item => onSelect(item.value as TValue)}
 					/>

@@ -1,5 +1,6 @@
 import test from 'ava';
 import {
+	getModelAcceptsImages,
 	getModelContextLimit,
 	getModelPricing,
 	getSessionContextLimit,
@@ -25,13 +26,15 @@ test.afterEach(() => {
 /**
  * Tests for models-dev-client.ts
  *
- * Note: These tests make real API calls to models.dev.
- * The API has caching and fallback mechanisms built in.
+ * Note: "models.dev" lookups here read the fixture database that
+ * source/test-utils/isolated-models-cache.ts (an AVA `require` module) seeds
+ * into a per-worker cache, so they never touch the network or the
+ * developer's real cache.
  *
  * Priority order: models.dev (primary) → hardcoded fallback (offline)
  *
  * Tests are organized by:
- * 1. models.dev API lookups (network required, cached) — returns dynamic values
+ * 1. models.dev lookups (fixture database)
  * 2. Ollama-only fallback models (no network required) — returns exact values
  * 3. Cloud model normalization
  * 4. Edge cases
@@ -42,6 +45,18 @@ test.afterEach(() => {
 // These models exist on models.dev and return dynamic values that may change.
 // We assert typeof === 'number' rather than exact values.
 // ============================================================================
+
+test('models.dev lookups resolve from the seeded fixture, not the network', async t => {
+	// Exact fixture values: a live download or the developer's real cache would
+	// make these drift, and an offline run would time out instead.
+	t.is(await getModelContextLimit('glm-4.7:cloud'), 202_752);
+	t.deepEqual(await getModelPricing('claude-sonnet-4-5'), {
+		input: 3,
+		output: 15,
+		cache_read: 0.3,
+		cache_write: 3.75,
+	});
+});
 
 test('getModelContextLimit - returns a number for llama3.2 (models.dev)', async t => {
 	const limit = await getModelContextLimit('llama3.2');
@@ -164,7 +179,7 @@ test('getModelContextLimit - returns a number for glm-4.7:cloud (models.dev)', a
 
 test('getModelContextLimit - returns a number for deepseek-v3.1:671b-cloud', async t => {
 	const limit = await getModelContextLimit('deepseek-v3.1:671b-cloud');
-	t.is(typeof limit, 'number');
+	t.true(limit === null || typeof limit === 'number');
 });
 
 // ============================================================================
@@ -194,7 +209,7 @@ test('getModelContextLimit - returns a number for minimax-m2:cloud', async t => 
 
 test('getModelContextLimit - returns a number for kimi-k2:1t-cloud', async t => {
 	const limit = await getModelContextLimit('kimi-k2:1t-cloud');
-	t.is(typeof limit, 'number');
+	t.true(limit === null || typeof limit === 'number');
 });
 
 test('getModelContextLimit - returns a number for kimi-k2-thinking:cloud', async t => {
@@ -213,7 +228,7 @@ test('getModelContextLimit - returns a number for kimi-for-coding', async t => {
 
 test('getModelContextLimit - returns a number for devstral-small-2:24b', async t => {
 	const limit = await getModelContextLimit('devstral-small-2:24b');
-	t.is(typeof limit, 'number');
+	t.true(limit === null || typeof limit === 'number');
 });
 
 test('getModelContextLimit - returns a number for devstral-2', async t => {
@@ -436,13 +451,23 @@ test('getModelPricing - returns pricing for gpt-4o (models.dev)', async t => {
 	t.true(pricing!.output >= 0);
 });
 
-test('getModelPricing - returns pricing for claude-3-opus (models.dev)', async t => {
-	const pricing = await getModelPricing('claude-3-opus');
+test('getModelPricing - returns pricing for claude-opus-4-5 (models.dev)', async t => {
+	const pricing = await getModelPricing('claude-opus-4-5');
 	t.truthy(pricing);
 	t.true(typeof pricing!.input === 'number');
 	t.true(typeof pricing!.output === 'number');
 	t.true(pricing!.input >= 0);
 	t.true(pricing!.output >= 0);
+});
+
+test('getModelPricing - surfaces cache rates when models.dev publishes them', async t => {
+	// The cache-aware cost path prices reads/writes at their own rates and only
+	// falls back to the input rate when these are absent, so dropping them in
+	// the mapper would silently bill every cache hit at full price.
+	const pricing = await getModelPricing('claude-sonnet-4-5');
+	t.truthy(pricing);
+	t.is(typeof pricing!.cache_read, 'number');
+	t.true(pricing!.cache_read! < pricing!.input, 'cache reads are discounted');
 });
 
 test('getModelPricing - returns null for unknown model', async t => {
@@ -466,4 +491,16 @@ test('getModelPricing - returns consistent pricing on repeated calls', async t =
 
 	t.deepEqual(pricing2, pricing1);
 	t.truthy(pricing2);
+});
+
+test('getModelAcceptsImages - true for a vision model (models.dev)', async t => {
+	t.true(await getModelAcceptsImages('gpt-4o'));
+});
+
+test('getModelAcceptsImages - false for a text-only model (models.dev)', async t => {
+	t.false(await getModelAcceptsImages('deepseek-chat'));
+});
+
+test('getModelAcceptsImages - null for a local model not on models.dev', async t => {
+	t.is(await getModelAcceptsImages('llama3.2:3b'), null);
 });

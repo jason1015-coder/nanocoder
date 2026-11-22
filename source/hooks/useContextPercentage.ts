@@ -1,4 +1,9 @@
 import {useEffect, useRef} from 'react';
+import {
+	filterModelFacing,
+	isModelFacing,
+} from '@/conversation/message-visibility';
+import {getLastBuiltPrompt} from '@/conversation/prompt-builder';
 import {getModelContextLimit} from '@/models/index';
 import type {ToolManager} from '@/tools/tool-manager';
 import type {AIProviderConfig, TuneConfig} from '@/types/config';
@@ -15,7 +20,6 @@ import {
 	calculateToolDefinitionsTokensFromDefs,
 } from '@/usage/calculator';
 import {resolveContextUsage} from '@/usage/context-source';
-import {getLastBuiltPrompt} from '@/utils/prompt-builder';
 
 interface UseContextPercentageProps {
 	currentModel: string;
@@ -114,8 +118,10 @@ export function useContextPercentage({
 			content: systemPrompt,
 		};
 
+		// Display-only notices never reach the provider, so they must not show up
+		// in the context figure that reports what the provider is holding.
 		const breakdown = calculateTokenBreakdown(
-			[systemMessage, ...messages],
+			[systemMessage, ...filterModelFacing(messages)],
 			tokenizer,
 			(message: Message) => {
 				// System message won't be in the cache, use tokenizer directly
@@ -160,7 +166,10 @@ export function useContextPercentage({
 		const apiAtCount = lastApiUsage?.atMessageCount ?? null;
 		let tailTokens = streamingTokenCount;
 		if (apiAtCount !== null && apiAtCount <= messages.length) {
+			// Index against the full array — `atMessageCount` counts every message
+			// in history — but skip the notices the payload never carried.
 			for (let i = apiAtCount; i < messages.length; i++) {
+				if (!isModelFacing(messages[i])) continue;
 				tailTokens += getMessageTokens(messages[i]);
 			}
 		}

@@ -1,24 +1,26 @@
 import {readFile} from 'node:fs/promises';
-import {highlight} from 'cli-highlight';
+import {dirname} from 'node:path';
 import {Box, Text, useFocus, useInput} from 'ink';
 import {useEffect, useMemo, useState} from 'react';
-import {StyledTitle} from '@/components/ui/styled-title';
+import {TitledBoxWithPreferences} from '@/components/ui/titled-box';
+import {getSyntaxTheme} from '@/config/themes';
 import {
 	CHARS_PER_TOKEN_ESTIMATE,
 	FILE_EXPLORER_TOKEN_WARNING_THRESHOLD,
 	FILE_EXPLORER_VISIBLE_ITEMS,
 } from '@/constants';
+import {useTerminalWidth} from '@/hooks/useTerminalWidth';
 import {useTheme} from '@/hooks/useTheme';
-import {useTitleShape} from '@/hooks/useTitleShape';
 import {useUIStateContext} from '@/hooks/useUIState';
+import {highlight} from '@/terminal/highlighter';
+import {compressIndentation} from '@/terminal/indentation-normalizer';
 import type {FileExplorerProps, ViewMode} from '@/types/file-explorer';
 import {
 	buildFileTree,
 	type FileNode,
 	flattenTree,
 	flattenTreeAll,
-} from '@/utils/file-tree';
-import {compressIndentation} from '@/utils/indentation-normalizer';
+} from '@/utils/fs/file-tree';
 import {getVSCodeServerSync} from '@/vscode/vscode-server';
 import {TreeItem} from './tree-item';
 import {
@@ -28,9 +30,39 @@ import {
 	getLanguageFromPath,
 } from './utils';
 
+/**
+ * Rounded, titled frame shared by every explorer view (loading, error, tree,
+ * preview) so switching views never changes the chrome. Matches the box the
+ * session and IDE selectors use, which is what the rest of the modal surfaces
+ * in this UI look like.
+ */
+function ExplorerFrame({
+	title,
+	children,
+}: {
+	title: string;
+	children: React.ReactNode;
+}) {
+	const {colors} = useTheme();
+	const boxWidth = useTerminalWidth();
+
+	return (
+		<TitledBoxWithPreferences
+			title={title}
+			width={boxWidth}
+			borderColor={colors.primary}
+			flexDirection="column"
+			paddingX={2}
+			paddingY={1}
+			marginBottom={1}
+		>
+			{children}
+		</TitledBoxWithPreferences>
+	);
+}
+
 export function FileExplorer({onClose}: FileExplorerProps) {
 	const {colors} = useTheme();
-	const {currentTitleShape} = useTitleShape();
 	const {setPendingFileMentions} = useUIStateContext();
 
 	const [tree, setTree] = useState<FileNode[]>([]);
@@ -39,7 +71,11 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 	const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
 	const [loading, setLoading] = useState(true);
 	const [error, setError] = useState<string | null>(null);
-	const [preview, setPreview] = useState<string | null>(null);
+	// The plain, indentation-compressed source. Highlighting is derived from it
+	// below rather than stored, so switching theme with the preview open
+	// re-colours it instead of leaving the old palette until reselect.
+	const [previewSource, setPreviewSource] = useState<string | null>(null);
+	const [previewLanguage, setPreviewLanguage] = useState('plaintext');
 	const [previewError, setPreviewError] = useState<string | null>(null);
 	const [previewPath, setPreviewPath] = useState<string | null>(null);
 	const [viewMode, setViewMode] = useState<ViewMode>('tree');
@@ -82,6 +118,16 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 				)
 			: flatList;
 
+	// filteredList swaps between every search match and just the expanded rows
+	// (and shrinks when a directory collapses), but only the arrow handlers
+	// clamp selectedIndex. Leaving a search would strand it past the end of the
+	// shorter list: nothing highlighted, Up and Enter inert.
+	useEffect(() => {
+		setSelectedIndex(prev =>
+			Math.min(prev, Math.max(0, filteredList.length - 1)),
+		);
+	}, [filteredList.length]);
+
 	// Calculate scroll window
 	const scrollStart = Math.max(
 		0,
@@ -113,10 +159,24 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 		return Math.ceil(totalSize / CHARS_PER_TOKEN_ESTIMATE);
 	}, [selectedFiles, allNodes]);
 
+	// Re-runs when the palette changes, so a theme switch recolours an open
+	// preview. Highlighting failures fall back to the plain source.
+	const preview = useMemo(() => {
+		if (previewSource === null) return null;
+		try {
+			return highlight(previewSource, {
+				language: previewLanguage,
+				theme: getSyntaxTheme(colors),
+			});
+		} catch {
+			return previewSource;
+		}
+	}, [previewSource, previewLanguage, colors]);
+
 	// Load preview when entering preview mode
 	const loadPreviewForNode = async (node: FileNode) => {
 		if (node.isDirectory) {
-			setPreview(null);
+			setPreviewSource(null);
 			setPreviewError('Cannot preview directory');
 			return;
 		}
@@ -136,24 +196,13 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 			const compressedLines = compressIndentation(lines);
 			const compressedContent = compressedLines.join('\n');
 
-			// Apply syntax highlighting
-			let highlighted: string;
-			try {
-				highlighted = highlight(compressedContent, {
-					language: lang,
-					theme: 'default',
-				});
-			} catch {
-				// Fallback to plain text if highlighting fails
-				highlighted = compressedContent;
-			}
-
-			setPreview(highlighted);
+			setPreviewLanguage(lang);
+			setPreviewSource(compressedContent);
 			setPreviewPath(node.path);
 			setPreviewError(null);
 			setPreviewScroll(0);
 		} catch {
-			setPreview(null);
+			setPreviewSource(null);
 			setPreviewError('Cannot preview (binary or unreadable)');
 		}
 	};
@@ -215,18 +264,25 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 		}
 	};
 
+	// Collapse the highlighted directory if it is open, otherwise move up to
+	// its parent row. Paths come from path.join in buildFileTree, so they use
+	// the platform separator; dirname splits them the same way.
 	const handleGoUp = () => {
-		// Find parent directory and collapse it
 		if (!selectedNode) return;
-		const parts = selectedNode.path.split('/');
-		if (parts.length > 1) {
-			parts.pop();
-			const parentPath = parts.join('/');
+		if (selectedNode.isDirectory && expanded.has(selectedNode.path)) {
 			setExpanded(prev => {
 				const next = new Set(prev);
-				next.delete(parentPath);
+				next.delete(selectedNode.path);
 				return next;
 			});
+			return;
+		}
+		const parentPath = dirname(selectedNode.path);
+		const parentIndex = filteredList.findIndex(
+			item => item.node.path === parentPath,
+		);
+		if (parentIndex !== -1) {
+			setSelectedIndex(parentIndex);
 		}
 	};
 
@@ -316,8 +372,9 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 					toggleFileSelection(selectedNode.path);
 				}
 			}
-		} else if (key.backspace) {
-			// Go up one directory by collapsing current
+		} else if (key.backspace || key.delete) {
+			// Ink reports the usual Backspace byte (\x7f) as `delete`, so accept
+			// both.
 			handleGoUp();
 		}
 	});
@@ -328,27 +385,17 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 
 	if (loading) {
 		return (
-			<Box flexDirection="column" paddingX={1}>
-				<StyledTitle
-					title="/explorer"
-					borderColor={colors.primary}
-					shape={currentTitleShape}
-				/>
+			<ExplorerFrame title="/explorer">
 				<Text color={colors.text}>Loading file tree...</Text>
-			</Box>
+			</ExplorerFrame>
 		);
 	}
 
 	if (error) {
 		return (
-			<Box flexDirection="column" paddingX={1}>
-				<StyledTitle
-					title="/explorer"
-					borderColor={colors.primary}
-					shape={currentTitleShape}
-				/>
+			<ExplorerFrame title="/explorer">
 				<Text color={colors.error}>Error: {error}</Text>
-			</Box>
+			</ExplorerFrame>
 		);
 	}
 
@@ -362,16 +409,9 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 		const isSelected = previewPath ? selectedFiles.has(previewPath) : false;
 
 		return (
-			<Box flexDirection="column" paddingX={1}>
-				{/* Title */}
-				<StyledTitle
-					title={`/explorer - ${previewPath}`}
-					borderColor={colors.primary}
-					shape={currentTitleShape}
-				/>
-
+			<ExplorerFrame title={`/explorer - ${previewPath}`}>
 				{/* Selection status */}
-				<Box marginTop={1}>
+				<Box>
 					<Text color={isSelected ? colors.success : colors.secondary}>
 						{isSelected ? '✓ Selected' : '✗ Not selected'}
 					</Text>
@@ -421,23 +461,16 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 						Up/Down: scroll | Space: toggle select | Shift+Tab/Esc: back
 					</Text>
 				</Box>
-			</Box>
+			</ExplorerFrame>
 		);
 	}
 
 	// Tree mode view
 	return (
-		<Box flexDirection="column" paddingX={1}>
-			{/* Title */}
-			<StyledTitle
-				title="/explorer"
-				borderColor={colors.primary}
-				shape={currentTitleShape}
-			/>
-
+		<ExplorerFrame title="/explorer">
 			{/* Search indicator */}
 			{searchMode && (
-				<Box marginTop={1}>
+				<Box>
 					<Text color={colors.primary}>
 						Search: <Text bold>{searchQuery || '_'}</Text>
 					</Text>
@@ -457,8 +490,13 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 				</Box>
 			)}
 
-			{/* Tree list */}
-			<Box flexDirection="column" marginTop={1}>
+			{/* Tree list. The frame's own padding already spaces the first row,
+			    so only separate from a search / selection header when one is
+			    actually above it. */}
+			<Box
+				flexDirection="column"
+				marginTop={searchMode || selectedFiles.size > 0 ? 1 : 0}
+			>
 				{visibleItems.length === 0 ? (
 					<Text color={colors.secondary}>
 						{searchQuery ? 'No matches found' : 'Empty directory'}
@@ -499,10 +537,10 @@ export function FileExplorer({onClose}: FileExplorerProps) {
 					<Text color={colors.secondary}>
 						{searchMode
 							? 'Type to filter | Backspace: delete | Esc: exit search'
-							: 'Up/Down: navigate | Enter: expand/preview | Space: select | /: search | Esc: done'}
+							: 'Up/Down: navigate | Enter: expand/preview | Backspace: up | Space: select | /: search | Esc: done'}
 					</Text>
 				</Box>
 			</Box>
-		</Box>
+		</ExplorerFrame>
 	);
 }

@@ -2,9 +2,23 @@ import {spawn} from 'node:child_process';
 import {existsSync} from 'node:fs';
 import {isAbsolute, resolve} from 'node:path';
 import {TRUNCATION_OUTPUT_LIMIT} from '@/constants';
-import {renderBody} from '@/custom-tools/template';
+import {
+	cmdQuote,
+	findUnsafePlaceholder,
+	renderBody,
+	shellQuote,
+} from '@/custom-tools/template';
+import {truncateToolResult} from '@/tools/runtime/truncate-tool-result';
 import type {CustomToolMetadata} from '@/types/custom-tools';
 import type {ToolHandler} from '@/types/index';
+import {isRealPathInside} from '@/utils/fs/path-validation';
+import {signalProcessTree} from '@/utils/process-tree';
+import {isWindowsCmd, shellArgs} from '@/utils/shell-args';
+import {
+	makeStreamCollector,
+	STDERR_TRUNCATION_NOTICE,
+	STDOUT_TRUNCATION_NOTICE,
+} from '@/utils/stream-collector';
 
 /**
  * Build a `ToolHandler` that renders the script body and runs it under the
@@ -17,10 +31,27 @@ export function buildHandler(
 	projectRoot: string,
 ): ToolHandler {
 	return async (args: Record<string, unknown>): Promise<string> => {
-		const rendered = renderBody(body, args ?? {});
+		const shell = pickShell(metadata.shell);
+		// The loader already rejects these bodies; check again here so a body
+		// that reached the handler another way still never runs unquoted values.
+		const declared = Object.keys(metadata.parameters);
+		const unsafe = findUnsafePlaceholder(
+			body,
+			isWindowsCmd(shell) ? 'cmd' : 'posix',
+			declared,
+		);
+		if (unsafe) throw new Error(`Custom tool body is unsafe: ${unsafe}`);
+		// Only declared parameters are substituted. The validator doesn't strip
+		// extra keys, and a model-supplied value for an undeclared name would
+		// otherwise fill a placeholder nobody checked, such as one in a comment.
+		const filled = applyParameterDefaults(metadata, args ?? {});
+		const rendered = renderBody(
+			body,
+			Object.fromEntries(declared.map(name => [name, filled[name]])),
+			isWindowsCmd(shell) ? cmdQuote : shellQuote,
+		);
 		const cwd = resolveCwd(metadata.cwd, projectRoot);
 		const env = mergeEnv(metadata.env);
-		const shell = pickShell(metadata.shell);
 		return runScript(rendered, {
 			cwd,
 			env,
@@ -28,6 +59,24 @@ export function buildHandler(
 			timeoutMs: metadata.timeoutMs,
 		});
 	};
+}
+
+/**
+ * Fill each omitted argument with its declared `default:`. The JSON schema
+ * advertises defaults to the model, but models routinely leave optional
+ * arguments out, so the template has to apply them itself.
+ */
+export function applyParameterDefaults(
+	metadata: CustomToolMetadata,
+	args: Record<string, unknown>,
+): Record<string, unknown> {
+	const filled = {...args};
+	for (const [name, def] of Object.entries(metadata.parameters)) {
+		if (filled[name] === undefined && def.default !== undefined) {
+			filled[name] = def.default;
+		}
+	}
+	return filled;
 }
 
 export interface RunOptions {
@@ -52,53 +101,97 @@ export function runScript(
 	options: RunOptions,
 ): Promise<string> {
 	return new Promise((resolvePromise, rejectPromise) => {
-		const child = spawn(options.shell, ['-c', script], {
+		// On Unix the child leads its own process group (detached) so the whole
+		// subtree can be signalled together; a tool that backgrounds a long-lived
+		// child must not be able to outlive the shell's timeout.
+		const child = spawn(options.shell, shellArgs(options.shell, script), {
 			cwd: options.cwd,
 			env: options.env,
 			stdio: ['ignore', 'pipe', 'pipe'],
+			detached: process.platform !== 'win32',
+			// cmd.exe parses a command string itself. Let it receive the wrapper and
+			// the doubled quotes from shellArgs verbatim; libuv quoting them again
+			// changes the argv seen by the child command.
+			windowsVerbatimArguments: isWindowsCmd(options.shell),
 		});
 
 		let stdout = '';
 		let stderr = '';
-		let timedOut = false;
+		let settled = false;
 
 		const timer = setTimeout(() => {
-			timedOut = true;
-			child.kill('SIGTERM');
-			// Force-kill if the process refuses to exit within a grace window.
-			setTimeout(() => {
-				if (!child.killed) child.kill('SIGKILL');
-			}, 1_000).unref();
+			// Drop our end of the pipes first so a detached grandchild that
+			// inherited them cannot keep them readable, then signal the whole
+			// process group.
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			signalProcessTree(child);
+
+			// Force-kill the group if it refuses to die within a grace window.
+			// No `!child.killed` guard: Node sets that flag the moment a signal
+			// is delivered, so it is already true here and the escalation would
+			// never run (see #1141). Nothing cancels this timer either -- unlike
+			// the single-process case, the shell exiting does not mean its group
+			// is empty, and reaping a descendant that ignored SIGTERM is the
+			// whole point. Firing against an already-dead group is harmless:
+			// signalProcessTree swallows the ESRCH, and it is unref'd so it never
+			// holds the process open. Windows already used taskkill /F.
+			if (process.platform !== 'win32') {
+				setTimeout(() => {
+					signalProcessTree(child, 'SIGKILL');
+				}, 1_000).unref();
+			}
+
+			// Settle now rather than waiting for `exit`/`close`: neither is
+			// guaranteed to be prompt while a descendant holds an inherited
+			// pipe, and the captured output is discarded on this path anyway.
+			settle(() =>
+				rejectPromise(
+					new Error(`Custom tool timed out after ${options.timeoutMs}ms`),
+				),
+			);
 		}, options.timeoutMs);
 
-		child.stdout?.on('data', chunk => {
-			stdout += chunk.toString();
-		});
-		child.stderr?.on('data', chunk => {
-			stderr += chunk.toString();
-		});
+		// Guard every completion path: an `error`/`close` arriving after the
+		// timeout already settled must not settle the promise a second time.
+		const settle = (finish: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			finish();
+		};
+
+		// Per-stream byte budgets, shared with the built-in bash executor.
+		const stdoutCollector = makeStreamCollector(text => {
+			stdout += text;
+		}, STDOUT_TRUNCATION_NOTICE);
+		const stderrCollector = makeStreamCollector(text => {
+			stderr += text;
+		}, STDERR_TRUNCATION_NOTICE);
+		child.stdout?.on('data', stdoutCollector.collect);
+		child.stderr?.on('data', stderrCollector.collect);
 
 		child.on('error', err => {
-			clearTimeout(timer);
-			rejectPromise(new Error(`Custom tool failed to start: ${err.message}`));
+			settle(() =>
+				rejectPromise(new Error(`Custom tool failed to start: ${err.message}`)),
+			);
 		});
 
 		child.on('close', code => {
-			clearTimeout(timer);
-			if (timedOut) {
-				rejectPromise(
-					new Error(`Custom tool timed out after ${options.timeoutMs}ms`),
+			settle(() => {
+				// Release any multi-byte character the decoders were holding
+				// across a chunk boundary before the output is formatted.
+				stdoutCollector.flush();
+				stderrCollector.flush();
+				resolvePromise(
+					truncateToolResult(
+						formatScriptOutput(code, stdout, stderr),
+						TRUNCATION_OUTPUT_LIMIT,
+					),
 				);
-				return;
-			}
-			resolvePromise(truncate(formatScriptOutput(code, stdout, stderr)));
+			});
 		});
 	});
-}
-
-function truncate(text: string): string {
-	if (text.length <= TRUNCATION_OUTPUT_LIMIT) return text;
-	return text.slice(0, TRUNCATION_OUTPUT_LIMIT) + '\n... [Output truncated]';
 }
 
 /**
@@ -113,6 +206,8 @@ function formatScriptOutput(
 	stderr: string,
 ): string {
 	const exitCode = code ?? 0;
+	// Any cap notice is already inline at the end of its own stream (see
+	// makeStreamCollector), so it survives the tail-keeping truncation below.
 	const out = stdout.trimEnd();
 	const err = stderr.trimEnd();
 	const prefix = `EXIT_CODE: ${exitCode}\n`;
@@ -124,9 +219,20 @@ function formatScriptOutput(
 
 /**
  * Resolve the working directory with `${VAR}` substitution from process.env.
- * Relative paths resolve against the project root. Returns the project root
- * if the configured directory doesn't exist (so we don't hard-fail on a
- * stale checkout).
+ * Relative paths resolve against the project root.
+ *
+ * Returns the project root if the configured directory doesn't exist, so we
+ * don't hard-fail on a stale checkout.
+ *
+ * Throws if the directory exists but really sits outside the project once
+ * symlinks are resolved (a symlinked `./scripts`, an absolute path, `${HOME}`).
+ * Falling back to the project root would be worse than refusing: a tool whose
+ * body is `rm -rf ./*` and whose cwd was meant to be a scratch directory would
+ * then run that against the project itself. The escape is a misconfiguration
+ * and the user needs to see it, not have it silently redirected.
+ *
+ * Note this is containment, not a sandbox — the rendered body is arbitrary
+ * shell and can `cd` anywhere it likes.
  */
 export function resolveCwd(
 	configured: string | undefined,
@@ -137,7 +243,13 @@ export function resolveCwd(
 	const absolute = isAbsolute(expanded)
 		? expanded
 		: resolve(projectRoot, expanded);
-	return existsSync(absolute) ? absolute : projectRoot;
+	if (!existsSync(absolute)) return projectRoot;
+	if (!isRealPathInside(absolute, projectRoot)) {
+		throw new Error(
+			`Custom tool cwd escapes the project directory: ${configured} -> ${absolute}`,
+		);
+	}
+	return absolute;
 }
 
 /**
@@ -171,7 +283,8 @@ export function expandVars(value: string): string {
 	});
 }
 
-function pickShell(configured: string | undefined): string {
+/** The shell a tool runs under: its `shell:` setting, else the platform default. */
+export function pickShell(configured: string | undefined): string {
 	if (configured === 'bash') return '/bin/bash';
 	if (configured === 'sh') return '/bin/sh';
 	if (process.platform === 'win32') return process.env.ComSpec || 'cmd.exe';

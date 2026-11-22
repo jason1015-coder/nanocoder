@@ -1,15 +1,30 @@
 import React from 'react';
 import {appendToolDefinitionsToPrompt} from '@/ai-sdk-client/tools/system-prompt-assembler';
 import {ConversationStateManager} from '@/app/utils/conversation-state';
+import {infoMsg} from '@/components/message-factory';
 import UserMessage from '@/components/user-message';
 import {getAppConfig} from '@/config/index';
+import {
+	getPreferencesVersion,
+	getProfessionalTone,
+	getProjectContextPreferences,
+	subscribeToPreferences,
+} from '@/config/preferences';
+import {MessageBuilder} from '@/conversation/message-builder';
+import {
+	buildSystemPrompt,
+	setLastBuiltPrompt,
+} from '@/conversation/prompt-builder';
 import {CommandIntegration} from '@/custom-commands/command-integration';
-import {generateKey} from '@/session/key-generator';
+import {buildProjectContextSection} from '@/memory/project-context';
+import {SemanticMemoryManager} from '@/memory/semantic-memory-manager';
+import {processToolUse} from '@/message-handler';
+import {appendActivePlanContext} from '@/plans/context';
 import {getTuneToolMode} from '@/types/config';
 import type {ImageAttachment, Message} from '@/types/core';
-import {MessageBuilder} from '@/utils/message-builder';
-import {infoMsg} from '@/utils/message-factory';
-import {buildSystemPrompt, setLastBuiltPrompt} from '@/utils/prompt-builder';
+import {generateKey} from '@/utils/key-generator';
+import {getLogger} from '@/utils/logging';
+import {appendTurnContext} from '@/utils/turn-context';
 import {processAssistantResponse} from './conversation/conversation-loop';
 import {createResetStreamingState} from './state/streaming-state';
 import type {ChatHandlerReturn, UseChatHandlerProps} from './types';
@@ -72,13 +87,13 @@ export function useChatHandler({
 	currentModel,
 	setIsCancelling,
 	addToChatQueue,
-	abortController,
 	setAbortController,
 	developmentMode = 'normal',
 	developmentModeRef,
 	nonInteractiveMode = false,
 	onConversationComplete,
 	onPlanTurnComplete,
+	onArchitectTurnComplete,
 	reasoningExpandedRef,
 	compactToolDisplayRef,
 	onSetCompactToolCounts,
@@ -91,9 +106,17 @@ export function useChatHandler({
 	subagentsReady,
 	privacySessionMapRef,
 	privacyEnabled,
+	memoryFinder,
+	projectContextOptions,
+	ensureCurrentSessionId,
 }: UseChatHandlerProps): ChatHandlerReturn {
 	// Conversation state manager for enhanced context
 	const conversationStateManager = React.useRef(new ConversationStateManager());
+
+	const projectMemoryFinder = React.useMemo(
+		() => memoryFinder ?? new SemanticMemoryManager(),
+		[memoryFinder],
+	);
 
 	// Resolve the active fallback format when native tools are disabled. When
 	// native is on, this value is unused. The tune override takes priority over
@@ -119,11 +142,21 @@ export function useChatHandler({
 	const fallbackToolFormat: 'xml' | 'json' =
 		tuneToolMode === 'json' ? 'json' : 'xml';
 
-	// Cache the base system prompt — only rebuild when mode, tune, tools, or toolsDisabled change
+	// Prompt-affecting preferences (Professional Tone) are written straight to
+	// disk by the settings panel, so subscribe to those writes explicitly.
+	// Without this the memo below only picks the change up on the next mode or
+	// model switch, which reads as the toggle silently not working.
+	const preferencesVersion = React.useSyncExternalStore(
+		subscribeToPreferences,
+		getPreferencesVersion,
+	);
+
+	// Cache the base system prompt — only rebuild when mode, tune, tools, toolsDisabled
+	// or a prompt-affecting preference change
 	// This preserves KV cache by keeping the system message stable across turns
 	// When native tools are disabled, XML tool definitions are included in the prompt
 	// so token counting reflects the full system message the model actually sees.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: subagentsReady isn't read in the callback, but flipping it must invalidate the memo so buildSystemPrompt re-reads the module-level subagent cache populated by setAvailableSubagents.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: subagentsReady and preferencesVersion aren't read in the callback, but flipping either must invalidate the memo — subagentsReady so buildSystemPrompt re-reads the module-level subagent cache populated by setAvailableSubagents, preferencesVersion so it re-reads getProfessionalTone().
 	const cachedBasePrompt = React.useMemo(() => {
 		if (!toolManager) return null;
 		const availableNames = toolManager.getAvailableToolNames(
@@ -139,6 +172,8 @@ export function useChatHandler({
 			toolsDisabled,
 			getAppConfig().systemPrompt,
 			currentModel,
+			getProfessionalTone(),
+			toolManager,
 		);
 
 		const tools = toolsDisabled
@@ -163,6 +198,7 @@ export function useChatHandler({
 		fallbackToolFormat,
 		subagentsReady,
 		currentModel,
+		preferencesVersion,
 	]);
 
 	// Track when the current conversation started for elapsed time display
@@ -214,7 +250,24 @@ export function useChatHandler({
 
 	// Wrapper for processAssistantResponse that includes error handling
 	const processAssistantResponseWithErrorHandling = React.useCallback(
-		async (systemMessage: Message, msgs: Message[]) => {
+		async (
+			systemMessage: Message,
+			msgs: Message[],
+			sessionId?: string,
+			onToolExecuted?: (toolName: string) => void,
+			onFinalAssistantText?: (content: string) => void,
+			architectCheckpointState?: {
+				created: boolean;
+				name?: string;
+			},
+			// The turn's controller, passed by the caller that created it. Reading
+			// the `abortController` prop here instead would see the value from the
+			// render this callback was memoised in - usually null, since the
+			// caller's setAbortController has not re-rendered yet - and the loop
+			// would mint a second controller that the caller's abort checks never
+			// see.
+			turnController?: AbortController,
+		) => {
 			if (!client) return;
 
 			try {
@@ -223,7 +276,7 @@ export function useChatHandler({
 					messages: msgs,
 					client,
 					toolManager,
-					abortController,
+					abortController: turnController ?? null,
 					setAbortController,
 					setIsGenerating,
 					setStreamingReasoning,
@@ -237,6 +290,7 @@ export function useChatHandler({
 					developmentModeRef,
 					nonInteractiveMode,
 					conversationStateManager,
+					architectCheckpointState,
 					onConversationComplete,
 					conversationStartTime: conversationStartTimeRef.current,
 					reasoningExpandedRef,
@@ -250,6 +304,10 @@ export function useChatHandler({
 					tune,
 					privacySessionMapRef,
 					privacyEnabled,
+					sessionId,
+					workingDirectory: process.cwd(),
+					onToolExecuted,
+					onFinalAssistantText,
 					onPrivacyEvent: (count: number) => {
 						// `count` is the number of NEW identifiers scrubbed on this turn
 						// (the per-turn delta), not a session running total.
@@ -272,7 +330,6 @@ export function useChatHandler({
 		[
 			client,
 			toolManager,
-			abortController,
 			setAbortController,
 			setMessages,
 			addToChatQueue,
@@ -303,8 +360,26 @@ export function useChatHandler({
 		message: string,
 		displayValue?: string,
 		images?: ImageAttachment[],
+		historyMessages?: Message[],
 	) => {
-		if (!client || !toolManager) return;
+		if (!client || !toolManager) {
+			// handleMessageSubmit marks a turn as incomplete before reaching this
+			// hook. Signal completion here as well so an unavailable setup cannot
+			// leave the queue blocked forever.
+			onConversationComplete?.();
+			return;
+		}
+		const sessionId = ensureCurrentSessionId?.();
+		let wrotePlan = false;
+		let finalAssistantText = '';
+
+		// Lifetime /stats: count each user turn (fire-and-forget).
+		try {
+			const {recordUserPrompt} = await import('@/stats/record');
+			recordUserPrompt(currentProvider, currentModel);
+		} catch {
+			// Stats must never block chat.
+		}
 
 		// Record conversation start time for elapsed time display
 		conversationStartTimeRef.current = Date.now();
@@ -316,7 +391,12 @@ export function useChatHandler({
 		const displayMessage = displayValue ?? message;
 
 		// Add user message to chat using display version (with placeholders)
-		// Pass the full assembled message for accurate token counting
+		// Pass the full assembled message for accurate token counting.
+		//
+		// Queued before the per-turn context below, which awaits a semantic
+		// memory search: the bubble must echo immediately, not after a disk
+		// round-trip. The block it omits is counted in the status-line context
+		// %, which measures the message array rather than this bubble.
 		addToChatQueue(
 			<UserMessage
 				key={generateKey('user')}
@@ -326,9 +406,61 @@ export function useChatHandler({
 			/>,
 		);
 
-		// Add user message to conversation history (single addition)
+		// Create abort controller for cancellation. This is the turn's only
+		// controller: it is handed to the conversation loop explicitly, so the
+		// one Escape aborts (app state) is the one the checks below read.
+		//
+		// Created before the per-turn context below, which awaits a semantic
+		// memory search: Escape pressed during that search has to land on this
+		// turn's controller, or the turn would go on to call the model with a
+		// signal nobody can abort.
+		const controller = new AbortController();
+		setAbortController(controller);
+
+		// Per-turn context (skills matched for this request, memories recalled
+		// for it) rides at the end of the user message rather than being
+		// appended to the system prompt, so the system block stays byte-stable
+		// for the session and history remains append-only (#1574).
+		//
+		// Best-effort, matching the recall below: context is an optimization, so
+		// a broken skills loader degrades this turn instead of failing it.
+		let skillsSection = '';
+		try {
+			skillsSection = commandIntegration?.buildSkillsSection(message) ?? '';
+		} catch (error) {
+			getLogger().warn({error}, 'Failed to build the skills section');
+		}
+		const projectContext = await buildProjectContextSection(
+			message,
+			projectMemoryFinder,
+			// Preferences supply the defaults; an explicit prop still wins so
+			// callers (and tests) can override per session.
+			{...getProjectContextPreferences(), ...projectContextOptions},
+		);
+		const messageWithContext = appendTurnContext(message, [
+			skillsSection,
+			projectContext.content,
+		]);
+
+		if (projectContext.memoryCount > 0) {
+			addToChatQueue(
+				infoMsg(
+					`Recalling ${projectContext.memoryCount} project memor${projectContext.memoryCount === 1 ? 'y' : 'ies'}...`,
+					'memory-recall',
+				),
+			);
+		}
+
+		// Add user message to conversation history (single addition). Any
+		// caller-supplied historyMessages (e.g. the preceding turns of a
+		// multi-message MCP prompt) are spliced in first, preserving their
+		// original roles, so a few-shot prompt keeps its turn structure
+		// instead of being flattened into this one user message.
 		const builder = new MessageBuilder(messages);
-		builder.addUserMessage(message, images);
+		for (const historyMessage of historyMessages ?? []) {
+			builder.addMessage(historyMessage);
+		}
+		builder.addUserMessage(messageWithContext, images);
 		const updatedMessages = builder.build();
 		setMessages(updatedMessages);
 
@@ -337,11 +469,19 @@ export function useChatHandler({
 			conversationStateManager.current.initializeState(message);
 		}
 
-		// Create abort controller for cancellation
-		const controller = new AbortController();
-		setAbortController(controller);
+		// Keep Architect checkpoint state for the entire user turn.
+		const architectCheckpointState: {
+			created: boolean;
+			name?: string;
+		} = {
+			created: false,
+		};
 
 		try {
+			// Skills and recalled memories are no longer appended here: they
+			// travel in the user message (see above), which is what makes the
+			// memo's "stable across turns" claim actually hold. The persisted
+			// plan block below is the one remaining per-turn addition.
 			let systemPrompt = getBaseSystemPrompt(
 				developmentMode,
 				cachedBasePrompt,
@@ -351,13 +491,18 @@ export function useChatHandler({
 				currentModel,
 			);
 
-			// Enhance with relevant commands (progressive disclosure)
-			if (commandIntegration) {
-				systemPrompt = commandIntegration.enhanceSystemPrompt(
-					systemPrompt,
-					message,
-				);
-			}
+			// Persisted plan state changes between turns and must be visible after
+			// a restart, so it is appended here rather than baked into the cached
+			// base prompt. It costs the prefix on every turn of a session with an
+			// active plan — the same cost #1574 removes for skills and memories —
+			// but moving it is out of scope here, so it keeps main's behaviour.
+			//
+			// Published after the append, not before: the memo publishes the base
+			// prompt, and the context % has to measure what is actually sent. The
+			// moved skills/memory block is not double-counted, since it now lives
+			// in the message array the indicator already sums.
+			systemPrompt = await appendActivePlanContext(systemPrompt);
+			setLastBuiltPrompt(systemPrompt);
 
 			// Create stream request
 			const systemMessage: Message = {
@@ -369,7 +514,43 @@ export function useChatHandler({
 			await processAssistantResponseWithErrorHandling(
 				systemMessage,
 				updatedMessages,
+				sessionId,
+				toolName => {
+					if (toolName === 'write_plan') wrotePlan = true;
+				},
+				content => {
+					finalAssistantText = content;
+				},
+				architectCheckpointState,
+				controller,
 			);
+
+			if (
+				developmentMode === 'plan' &&
+				!wrotePlan &&
+				!controller.signal.aborted &&
+				finalAssistantText.trim()
+			) {
+				const fallbackResult = await processToolUse(
+					{
+						id: 'write-plan-fallback',
+						function: {
+							name: 'write_plan',
+							arguments: {content: finalAssistantText},
+						},
+					},
+					{
+						abortSignal: controller.signal,
+						sessionId,
+						workingDirectory: process.cwd(),
+					},
+				);
+				if (fallbackResult.isError) {
+					displayError(new Error(fallbackResult.content), 'plan-fallback');
+				} else {
+					wrotePlan = true;
+				}
+			}
 
 			// If this turn STARTED in plan mode (closure value, captured at submit
 			// time) and ran to completion without being interrupted, a plan was
@@ -377,8 +558,21 @@ export function useChatHandler({
 			// the start mode and the abort signal both in hand, avoids the race
 			// where toggling modes mid-generation makes an unrelated completing turn
 			// look like a finished plan.
-			if (developmentMode === 'plan' && !controller.signal.aborted) {
+			if (
+				developmentMode === 'plan' &&
+				wrotePlan &&
+				!controller.signal.aborted
+			) {
 				onPlanTurnComplete?.();
+			}
+
+			if (
+				developmentMode === 'architect' &&
+				architectCheckpointState.created &&
+				architectCheckpointState.name &&
+				!controller.signal.aborted
+			) {
+				onArchitectTurnComplete?.(architectCheckpointState.name);
 			}
 		} catch (error) {
 			displayError(error, 'chat-error');

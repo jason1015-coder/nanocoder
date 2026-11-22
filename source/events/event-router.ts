@@ -13,6 +13,8 @@
  * See `agents/2026-05-20-skills-unification-plan.md` step 8.
  */
 
+import {formatError} from '@/utils/error-formatter';
+import {globMatches} from '@/utils/fs/glob-match';
 import type {Event, EventKind, Subscription} from './types';
 
 export interface SubscriptionDispatcher {
@@ -23,7 +25,15 @@ export class EventRouter {
 	private readonly byKind: Map<EventKind, Subscription[]> = new Map();
 	private readonly byId: Map<string, Subscription> = new Map();
 
-	constructor(private readonly dispatcher: SubscriptionDispatcher) {}
+	constructor(
+		private readonly dispatcher: SubscriptionDispatcher,
+		/** Called once per subscription whose dispatch threw or rejected. */
+		private readonly onDispatchError: (
+			subscription: Subscription,
+			event: Event,
+			error: unknown,
+		) => void = logDispatchError,
+	) {}
 
 	subscribe(subscription: Subscription): void {
 		if (this.byId.has(subscription.id)) {
@@ -62,11 +72,33 @@ export class EventRouter {
 		const candidates = this.byKind.get(event.kind);
 		if (!candidates || candidates.length === 0) return;
 
+		// Every match runs at once. A dispatch resolves only when its whole
+		// triggered run ends, so awaiting them in turn made the second
+		// subscription wait out the first, and one throw skipped the rest.
+		// Per-subscription limits belong to the dispatcher (BackpressureDispatcher).
+		// emit() never rejects: sources fire it with `void`, where a rejection
+		// would be unhandled.
 		const matches = candidates.filter(sub => matchesFilter(sub, event));
-		for (const sub of matches) {
-			await this.dispatcher.dispatch(sub, event);
-		}
+		const results = await Promise.allSettled(
+			matches.map(async sub => this.dispatcher.dispatch(sub, event)),
+		);
+		results.forEach((result, i) => {
+			const sub = matches[i];
+			if (result.status === 'rejected' && sub) {
+				this.onDispatchError(sub, event, result.reason);
+			}
+		});
 	}
+}
+
+function logDispatchError(
+	subscription: Subscription,
+	event: Event,
+	error: unknown,
+): void {
+	console.error(
+		`Subscription "${subscription.id}" failed on ${event.kind}: ${formatError(error)}`,
+	);
 }
 
 export function matchesFilter(sub: Subscription, event: Event): boolean {
@@ -95,60 +127,52 @@ export function matchesFilter(sub: Subscription, event: Event): boolean {
 		return filter.cron === event.payload.cron;
 	}
 
+	if (event.kind === 'ci.job.failed' && sub.kind === 'ci.job.failed') {
+		const filter = sub.filter;
+		if (!filter?.branches || filter.branches.length === 0) return true;
+		return filter.branches.some(pattern =>
+			matchGlob(pattern, event.payload.branch),
+		);
+	}
+
+	if (event.kind === 'file.ai-comment' && sub.kind === 'file.ai-comment') {
+		const filter = sub.filter;
+		if (!filter?.paths || filter.paths.length === 0) return true;
+		return filter.paths.some(pattern => matchGlob(pattern, event.payload.file));
+	}
+
 	return false;
 }
 
-// Minimal glob -> regex matcher: enough for `docs/<star><star>`,
-// `src/<star><star>/*.ts`, `<star><star>/*.md`, literal paths, and `?`
-// single-character wildcards. Step 9 brings chokidar (and its picomatch dep)
-// into the tree, at which point we can swap this for picomatch and delete
-// the helper. Until then this is sufficient to make the router unit-testable.
-export function matchGlob(pattern: string, path: string): boolean {
-	const regex = globToRegex(pattern);
-	return regex.test(path);
+/**
+ * Rewrite Windows separators to `/` so patterns and paths meet on one shape.
+ *
+ * Subscription globs are always authored with `/`, but chokidar reports
+ * changes using the platform separator — on Windows `docs/**` would be asked
+ * to match `docs\guide.md` and never could. The matcher below also leans on
+ * `/` to stop `*` at a directory boundary, so an un-normalized path makes
+ * `*.md` match the nested `sub\a.md` as well.
+ */
+export function toPosixPath(path: string): string {
+	return path.split('\\').join('/');
 }
 
-function globToRegex(pattern: string): RegExp {
-	let out = '';
-	for (let i = 0; i < pattern.length; i++) {
-		const ch = pattern[i];
-		if (ch === '*') {
-			const next = pattern[i + 1];
-			if (next === '*') {
-				// `**` matches any characters including `/`
-				out += '.*';
-				i++;
-				// Consume a trailing `/` after `**` so `docs/**` matches `docs`
-				if (pattern[i + 1] === '/') i++;
-			} else {
-				// `*` matches anything except `/`
-				out += '[^/]*';
-			}
-		} else if (ch === '?') {
-			out += '[^/]';
-		} else if (
-			ch === '.' ||
-			ch === '+' ||
-			ch === '(' ||
-			ch === ')' ||
-			ch === '|' ||
-			ch === '^' ||
-			ch === '$' ||
-			ch === '{' ||
-			ch === '}' ||
-			ch === '[' ||
-			ch === ']' ||
-			ch === '\\'
-		) {
-			out += `\\${ch}`;
-		} else {
-			out += ch;
-		}
+/**
+ * Whether `path` matches a subscription, formatter or hook glob. Uses the
+ * shared matcher in utils/fs/glob-match (`*`, `?`, `**`, `{a,b}`; no `!`
+ * negation), after normalising both sides to `/`.
+ *
+ * A pattern ending in `**` + `/` keeps its long-standing meaning here of
+ * "anything under this directory", so `docs/**` + `/` matches `docs/a.md`.
+ * A pattern the matcher refuses (too long, or too many brace combinations)
+ * matches nothing rather than throwing out of the event loop.
+ */
+export function matchGlob(pattern: string, path: string): boolean {
+	let glob = toPosixPath(pattern);
+	if (glob.endsWith('**/')) glob = glob.slice(0, -1);
+	try {
+		return globMatches(toPosixPath(path), glob);
+	} catch {
+		return false;
 	}
-	// `out` is built by the escape loop above: every character is either a
-	// literal escaped with `\\`, or one of the fixed substrings `[^/]`, `.*`,
-	// `[^/]*`, `[^/]`. There is no user-supplied raw regex syntax in `out`.
-	// The shape is bounded by the glob length, so ReDoS is not reachable.
-	// nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
-	return new RegExp(`^${out}$`);
 }

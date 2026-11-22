@@ -89,3 +89,33 @@ export type NanocoderShape =
 	| 'simple3d'
 	| 'chrome'
 	| 'huge';
+
+/**
+ * Font the welcome wordmark falls back to when no Nanocoder Shape is saved.
+ * Shared by the banner and the settings panel so the value the panel reports
+ * as current is the one actually on screen.
+ */
+export const DEFAULT_NANOCODER_SHAPE: NanocoderShape = 'block';
+
+/** Border style of a titled box heading (`StyledTitle`). */
+export type TitleShape =
+	| 'rounded'
+	| 'square'
+	| 'double'
+	| 'pill'
+	| 'arrow-left'
+	| 'arrow-right'
+	| 'arrow-double'
+	| 'angled-box'
+	| 'powerline-angled'
+	| 'powerline-angled-thin'
+	| 'powerline-block'
+	| 'powerline-block-alt'
+	| 'powerline-curved'
+	| 'powerline-curved-thin'
+	| 'powerline-flame'
+	| 'powerline-flame-thin'
+	| 'powerline-graph'
+	| 'powerline-ribbon'
+	| 'powerline-segment'
+	| 'powerline-segment-thin';

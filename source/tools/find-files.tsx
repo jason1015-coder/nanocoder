@@ -3,11 +3,12 @@ import React from 'react';
 import ToolMessage from '@/components/tool-message';
 import {DEFAULT_FIND_FILES_RESULTS, MAX_FIND_FILES_RESULTS} from '@/constants';
 import {ThemeContext} from '@/hooks/useTheme';
+import {getContainedSessionCwd} from '@/services/session-cwd';
 import type {NanocoderToolExport} from '@/types/core';
 import {jsonSchema, tool} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {findMatchingPaths} from '@/utils/file-search';
-import {calculateTokens} from '@/utils/token-calculator';
+import {findMatchingPaths} from '@/utils/fs/file-search';
+import {estimateTokens} from '@/utils/token-calculator';
 
 /**
  * Find files matching a glob pattern using a cross-platform Node.js traversal
@@ -26,7 +27,9 @@ interface FindFilesArgs {
 }
 
 const executeFindFiles = async (args: FindFilesArgs): Promise<string> => {
-	const cwd = process.cwd();
+	// Clamp to the project root: a bash `cd` outside the project must not turn a
+	// pathless find into a glob over the whole filesystem.
+	const cwd = getContainedSessionCwd();
 	const maxResults = Math.min(
 		args.maxResults || DEFAULT_FIND_FILES_RESULTS,
 		MAX_FIND_FILES_RESULTS,
@@ -106,7 +109,7 @@ const FindFilesFormatter = React.memo(
 		}
 
 		// Calculate tokens
-		const tokens = result ? calculateTokens(result) : 0;
+		const tokens = result ? estimateTokens(result) : 0;
 
 		const messageContent = (
 			<Box flexDirection="column">

@@ -115,9 +115,9 @@ export class DaemonIpcServer {
 	}
 
 	private handleLine(socket: Socket, line: string): void {
-		let req: IpcRequest;
+		let parsed: unknown;
 		try {
-			req = JSON.parse(line) as IpcRequest;
+			parsed = JSON.parse(line);
 		} catch {
 			socket.write(
 				`${JSON.stringify({
@@ -127,6 +127,21 @@ export class DaemonIpcServer {
 			);
 			return;
 		}
+
+		if (
+			!parsed ||
+			typeof parsed !== 'object' ||
+			Array.isArray(parsed) ||
+			!('id' in parsed) ||
+			typeof parsed.id !== 'number' ||
+			!Number.isFinite(parsed.id) ||
+			!('method' in parsed) ||
+			typeof parsed.method !== 'string'
+		) {
+			this.respond(socket, 0, undefined, 'invalid request');
+			return;
+		}
+		const req = parsed as IpcRequest;
 
 		try {
 			switch (req.method) {
@@ -241,13 +256,19 @@ export class DaemonIpcClient {
 		method: IpcRequest['method'],
 		params?: unknown,
 	): Promise<unknown> {
-		if (!this.socket) throw new Error('IPC client not connected');
+		const socket = this.socket;
+		if (!socket) throw new Error('IPC client not connected');
 		const id = this.nextId++;
 		return new Promise((resolve, reject) => {
 			this.pending.set(id, {resolve, reject});
-			this.socket?.write(
-				`${JSON.stringify({id, method, params} satisfies IpcRequest)}\n`,
-			);
+			try {
+				socket.write(
+					`${JSON.stringify({id, method, params} satisfies IpcRequest)}\n`,
+				);
+			} catch (error) {
+				this.pending.delete(id);
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
 		});
 	}
 

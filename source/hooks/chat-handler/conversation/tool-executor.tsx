@@ -3,29 +3,34 @@ import type {ConversationStateManager} from '@/app/utils/conversation-state';
 import AgentProgress, {MultiAgentProgress} from '@/components/agent-progress';
 import BashProgress from '@/components/bash-progress';
 import {ErrorMessage} from '@/components/message-box';
+import {
+	ALWAYS_EXPANDED_TOOLS,
+	displayToolResult,
+	isToolResultError,
+	LIVE_TASK_TOOLS,
+	recordExpandableToolResult,
+} from '@/components/tool-result-display';
+import {getShowAgentBashOutput} from '@/config/preferences';
+import {
+	runStreamingBashTool,
+	type StreamingBashRun,
+} from '@/hooks/chat-handler/conversation/streaming-bash-tool';
 import type {BashExecutionState} from '@/services/bash-executor';
 import {
 	clearAllSubagentProgress,
 	getSubagentProgress,
 	resetSubagentProgressById,
 } from '@/services/subagent-events';
-import {generateKey} from '@/session/key-generator';
+import {buildSubagentFailureMessage} from '@/subagents/failure-message';
 import {MAX_CONCURRENT_AGENTS} from '@/subagents/subagent-executor';
 import type {AgentToolArgs} from '@/tools/agent-tool';
 import {startAgentExecution} from '@/tools/agent-tool';
+import {parseToolArguments} from '@/tools/runtime/tool-args-parser';
+import type {Task} from '@/tools/tasks/types';
 import type {ToolManager} from '@/tools/tool-manager';
-import type {ToolCall, ToolResult} from '@/types/core';
+import type {ToolCall, ToolExecutionContext, ToolResult} from '@/types/core';
 import {formatError} from '@/utils/error-formatter';
-import {
-	runStreamingBashTool,
-	type StreamingBashRun,
-} from '@/utils/streaming-bash-tool';
-import {parseToolArguments} from '@/utils/tool-args-parser';
-import {
-	ALWAYS_EXPANDED_TOOLS,
-	displayToolResult,
-	LIVE_TASK_TOOLS,
-} from '@/utils/tool-result-display';
+import {generateKey} from '@/utils/key-generator';
 
 /**
  * Validates and executes a single tool call.
@@ -65,6 +70,7 @@ const executeBashStreaming = async (
 	toolManager: ToolManager | null,
 	setLiveComponent: (component: React.ReactNode) => void,
 	signal?: AbortSignal,
+	sessionId?: string,
 ): Promise<StreamingBashRun> => {
 	const execution = await runStreamingBashTool(
 		toolCall,
@@ -72,6 +78,7 @@ const executeBashStreaming = async (
 		setLiveComponent,
 		'direct-bash',
 		signal,
+		sessionId,
 	);
 	return {...execution, toolCall};
 };
@@ -80,7 +87,7 @@ const executeBashStreaming = async (
 export interface ToolDisplayOptions {
 	compactDisplay?: boolean;
 	onCompactToolCount?: (toolName: string) => void;
-	onLiveTaskUpdate?: () => void;
+	onLiveTaskUpdate?: (tasks?: Task[]) => void;
 	nonInteractiveMode?: boolean;
 }
 
@@ -96,6 +103,7 @@ export const executeApprovedTool = (
 	processToolUse: (toolCall: ToolCall) => Promise<ToolResult>,
 	setLiveComponent?: (component: React.ReactNode) => void,
 	signal?: AbortSignal,
+	sessionId?: string,
 ): Promise<StreamingBashRun | {toolCall: ToolCall; result: ToolResult}> => {
 	if (toolCall.function.name === 'execute_bash' && setLiveComponent) {
 		return executeBashStreaming(
@@ -103,6 +111,7 @@ export const executeApprovedTool = (
 			toolManager,
 			setLiveComponent,
 			signal,
+			sessionId,
 		);
 	}
 	return executeOne(toolCall, processToolUse);
@@ -123,20 +132,37 @@ export const displayExecutedTool = async (
 ): Promise<void> => {
 	const {toolCall, result, bashState} = execution;
 
+	// Show the full bash card (command + status + output) instead of folding it
+	// into the compact tally. Needs a completed execution, so validation
+	// failures with no bashState still condense.
+	const showBashCard =
+		getShowAgentBashOutput() &&
+		result.name === 'execute_bash' &&
+		bashState !== undefined;
+
 	conversationStateManager.current.updateAfterToolExecution(
 		toolCall,
 		result.content,
 	);
+
+	const expandId = recordExpandableToolResult(toolCall, result, bashState);
 
 	if (
 		LIVE_TASK_TOOLS.has(result.name) &&
 		!result.content.startsWith('Error: ')
 	) {
 		// Task tools render in the live area (updating in-place)
-		options?.onLiveTaskUpdate?.();
+		const structured = result.structuredContent as
+			| {tasks?: unknown}
+			| undefined;
+		const tasks = Array.isArray(structured?.tasks)
+			? (structured.tasks as Task[])
+			: undefined;
+		options?.onLiveTaskUpdate?.(tasks);
 	} else if (
 		options?.compactDisplay &&
-		!ALWAYS_EXPANDED_TOOLS.has(result.name)
+		!ALWAYS_EXPANDED_TOOLS.has(result.name) &&
+		!showBashCard
 	) {
 		// In compact mode, signal the count callback for live display
 		// (skip for tools that should always show expanded output).
@@ -145,15 +171,12 @@ export const displayExecutedTool = async (
 		// per-tool one-liners straight to the static queue to keep
 		// tool activity in chronological order.
 		//
-		// Failures (generic "Error: …" or the streaming bash path's
-		// "⚒ Validation failed: …") don't fold into the count tally; they
-		// render as a condensed red one-liner ("⚒ write_file failed")
-		// instead of the full error. The model still receives the full
-		// error in conversation history — mirror displayToolResult's detection.
-		const isError =
-			result.content.startsWith('Error: ') ||
-			result.content.startsWith('⚒ Validation failed');
-		if (isError) {
+		// Failures don't fold into the count tally; they render as a
+		// condensed red one-liner ("⚒ write_file failed") instead of the
+		// full error. The model still receives the full error in
+		// conversation history — share displayToolResult's detection, so a
+		// command that merely exited non-zero cannot read as a success.
+		if (isToolResultError(result)) {
 			// Condense failures to a short red one-liner in compact mode.
 			await displayToolResult(
 				toolCall,
@@ -182,11 +205,19 @@ export const displayExecutedTool = async (
 				executionId={bashState.executionId}
 				command={bashState.command}
 				completedState={bashState}
+				showOutput={showBashCard}
 			/>,
 		);
 	} else {
 		// Full display mode
-		await displayToolResult(toolCall, result, toolManager, addToChatQueue);
+		await displayToolResult(
+			toolCall,
+			result,
+			toolManager,
+			addToChatQueue,
+			false,
+			expandId,
+		);
 	}
 };
 
@@ -247,6 +278,18 @@ const groupForParallelExecution = (
 };
 
 /**
+ * Renders a failed subagent run for the parent model.
+ *
+ * The `Error: ` prefix is load-bearing: callers detect a failed agent result
+ * by it. The rest is shared with the native agent tool's failure path.
+ */
+const buildFailedAgentContent = (agentResult: {
+	content: string;
+	error?: string;
+}): string =>
+	`Error: ${buildSubagentFailureMessage(agentResult.error, agentResult.content)}`;
+
+/**
  * Execute a batch of agent tool calls in parallel.
  * Returns tool results for all agents.
  */
@@ -259,6 +302,7 @@ const executeAgentBatch = async (
 	onCompactToolCount?: (toolName: string) => void,
 	nonInteractiveMode?: boolean,
 	signal?: AbortSignal,
+	executionContext?: Omit<ToolExecutionContext, 'abortSignal'>,
 ): Promise<
 	Array<{
 		toolCall: ToolCall;
@@ -298,7 +342,7 @@ const executeAgentBatch = async (
 
 		const {agentId, promise} = startAgentExecution(
 			parsedArgs as unknown as AgentToolArgs,
-			signal,
+			{...executionContext, abortSignal: signal},
 		);
 		resetSubagentProgressById(agentId);
 
@@ -370,10 +414,11 @@ const executeAgentBatch = async (
 			name: e.toolCall.function.name,
 			content: agentResult.success
 				? agentResult.content
-				: `Error: ${agentResult.error || 'Subagent execution failed'}`,
+				: buildFailedAgentContent(agentResult),
 		};
 
 		results.push({toolCall: e.toolCall, result});
+		recordExpandableToolResult(e.toolCall, result);
 
 		// Compact: feed into the shared count accumulator so delegated-task
 		// summaries group with other tool counts. Errors are still shown in
@@ -443,7 +488,12 @@ const executeAgentBatch = async (
  * Other tools are executed sequentially to preserve ordering.
  * Results are displayed in the original input order.
  *
- * @returns Array of tool results from executed tools
+ * Stops before the next tool once `options.signal` is aborted, so an Escape
+ * during one tool of an auto-approved batch does not let the rest run.
+ *
+ * @returns Results for the tools that ran, in input order. When the batch
+ * stops early (abort, or `beforeExecute` declining) this is a prefix of the
+ * input and the caller must pair the remaining tool calls with results.
  */
 export const executeToolsDirectly = async (
 	toolsToExecuteDirectly: ToolCall[],
@@ -453,7 +503,7 @@ export const executeToolsDirectly = async (
 	options?: {
 		compactDisplay?: boolean;
 		onCompactToolCount?: (toolName: string) => void;
-		onLiveTaskUpdate?: () => void;
+		onLiveTaskUpdate?: (tasks?: Task[]) => void;
 		setLiveComponent?: (component: React.ReactNode) => void;
 		/**
 		 * When true, compact tool results push a one-liner directly to the
@@ -467,10 +517,18 @@ export const executeToolsDirectly = async (
 		 * cancel (escape) propagates into running subagents.
 		 */
 		signal?: AbortSignal;
+		executionContext?: Omit<ToolExecutionContext, 'abortSignal'>;
+		/** Stop the batch when an execution-time approval decision changes. */
+		beforeExecute?: (toolCall: ToolCall) => Promise<boolean>;
 	},
 ): Promise<ToolResult[]> => {
 	// Import processToolUse here to avoid circular dependencies
 	const {processToolUse} = await import('@/message-handler');
+	const processToolWithContext = (toolCall: ToolCall) =>
+		processToolUse(toolCall, {
+			...options?.executionContext,
+			abortSignal: options?.signal,
+		});
 
 	// Group consecutive parallelizable tools
 	const groups = groupForParallelExecution(toolsToExecuteDirectly, toolManager);
@@ -478,6 +536,14 @@ export const executeToolsDirectly = async (
 	const directResults: ToolResult[] = [];
 
 	for (const {group, type} of groups) {
+		if (options?.signal?.aborted) {
+			return directResults;
+		}
+		for (const toolCall of group) {
+			if (options?.beforeExecute && !(await options.beforeExecute(toolCall))) {
+				return directResults;
+			}
+		}
 		let executions: Array<{
 			toolCall: ToolCall;
 			result: ToolResult;
@@ -497,6 +563,7 @@ export const executeToolsDirectly = async (
 				options?.onCompactToolCount,
 				options?.nonInteractiveMode,
 				options?.signal,
+				options?.executionContext,
 			);
 
 			// Agent results are already displayed by executeAgentBatch
@@ -513,19 +580,22 @@ export const executeToolsDirectly = async (
 		if (type === 'readOnly' && group.length > 1) {
 			// Parallel execution for consecutive read-only tools
 			executions = await Promise.all(
-				group.map(toolCall => executeOne(toolCall, processToolUse)),
+				group.map(toolCall => executeOne(toolCall, processToolWithContext)),
 			);
 		} else {
 			// Sequential execution for non-parallelizable tools (or single-item groups)
 			executions = [];
 			for (const toolCall of group) {
+				// Escape during the previous tool: don't start the next one.
+				if (options?.signal?.aborted) break;
 				executions.push(
 					await executeApprovedTool(
 						toolCall,
 						toolManager,
-						processToolUse,
+						processToolWithContext,
 						options?.setLiveComponent,
 						options?.signal,
+						options?.executionContext?.sessionId,
 					),
 				);
 			}
